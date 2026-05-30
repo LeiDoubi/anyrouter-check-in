@@ -80,6 +80,43 @@ class AccountBalance:
 		return self.quota is not None
 
 
+def format_balance_error(error: str | None) -> str:
+	if not error:
+		return '未知错误'
+
+	normalized = error.strip()
+	upper = normalized.upper()
+
+	if 'HTTP 401' in upper:
+		if '不匹配' in normalized or 'MISMATCH' in upper:
+			return 'api_user 不匹配'
+		return 'Cookie 过期'
+	if 'HTTP 403' in upper:
+		return '访问被拒绝'
+	if 'HTTP 404' in upper:
+		return '接口不存在'
+	if 'HTTP 5' in upper or 'HTTP 50' in upper:
+		match = re.search(r'HTTP (\d+)', normalized, re.IGNORECASE)
+		return f'HTTP {match.group(1)}' if match else '服务异常'
+	if 'WAF' in upper:
+		return 'WAF 失败'
+	if 'INVALID COOKIES' in upper:
+		return 'Cookie 无效'
+	if 'TIMEOUT' in upper or 'TIMED OUT' in upper:
+		return '请求超时'
+
+	match = re.search(r'HTTP (\d+)', normalized, re.IGNORECASE)
+	if match:
+		code = match.group(1)
+		if code == '401':
+			return 'Cookie 过期'
+		return f'HTTP {code}'
+
+	if len(normalized) <= 16:
+		return normalized
+	return f'{normalized[:14]}…'
+
+
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description='List balances and switch AnyRouter accounts locally.')
 	parser.add_argument(
@@ -350,18 +387,22 @@ def render_account_table(balances: list[AccountBalance]) -> None:
 	table.add_column('名称', style='bold', min_width=16)
 	table.add_column('余额', justify='right', min_width=10)
 	table.add_column('已用', justify='right', min_width=10)
+	table.add_column('状态', min_width=10)
 	table.add_column('平台', style='dim')
 	table.add_column('Token', justify='center', width=6)
 	table.add_column('当前', justify='center', width=4)
 
+	failed: list[AccountBalance] = []
 	for item in balances:
 		if item.quota_ok:
 			quota_cell = Text(f'${item.quota:.2f}', style='bold green')
 			used_cell = Text(f'${item.used_quota:.2f}', style='yellow')
+			status_cell = Text('正常', style='green')
 		else:
-			error_text = (item.error or 'N/A')[:28]
-			quota_cell = Text(error_text, style='bold red')
+			quota_cell = Text('-', style='dim')
 			used_cell = Text('-', style='dim')
+			status_cell = Text(format_balance_error(item.error), style='bold red')
+			failed.append(item)
 
 		token_cell = Text('✓', style='green') if item.has_auth_token else Text('✗', style='red')
 		current_cell = Text('●', style='bold green') if item.is_active else Text('', style='dim')
@@ -372,12 +413,29 @@ def render_account_table(balances: list[AccountBalance]) -> None:
 			Text(item.name, style=name_style),
 			quota_cell,
 			used_cell,
+			status_cell,
 			item.provider,
 			token_cell,
 			current_cell,
 		)
 
 	console.print(table)
+
+	if failed:
+		details = '\n'.join(
+			f'[bold white]{item.name}[/]: [red]{item.error or "未知错误"}[/]' for item in failed
+		)
+		console.print(
+			Panel(
+				details
+				+ '\n\n[dim]Cookie 过期：更新 session。\n'
+				'api_user 不匹配：重新运行 anyrouter-accounts 会自动修正，再 push 同步到 GitHub。[/]',
+				title='余额查询失败',
+				border_style='red',
+				padding=(1, 2),
+			)
+		)
+
 	console.print()
 
 
@@ -385,17 +443,30 @@ def print_account_table_plain(balances: list[AccountBalance]) -> None:
 	name_width = max(len(item.name) for item in balances)
 	name_width = max(name_width, len('名称'))
 	print()
-	print(f' {"#":>2}  {"名称":<{name_width}}  {"余额":>10}  {"已用":>10}  {"平台":<12}  Token  当前')
-	print(f' {"-" * 2}  {"-" * name_width}  {"-" * 10}  {"-" * 10}  {"-" * 12}  -----  ----')
+	print(f' {"#":>2}  {"名称":<{name_width}}  {"余额":>10}  {"已用":>10}  {"状态":<12}  {"平台":<12}  Token  当前')
+	print(f' {"-" * 2}  {"-" * name_width}  {"-" * 10}  {"-" * 10}  {"-" * 12}  {"-" * 12}  -----  ----')
+	failed: list[AccountBalance] = []
 	for item in balances:
-		quota = f'${item.quota:.2f}' if item.quota_ok else (item.error or 'N/A')
-		used = f'${item.used_quota:.2f}' if item.used_quota is not None else '-'
+		if item.quota_ok:
+			quota = f'${item.quota:.2f}'
+			used = f'${item.used_quota:.2f}'
+			status = '正常'
+		else:
+			quota = '-'
+			used = '-'
+			status = format_balance_error(item.error)
+			failed.append(item)
 		current = '✓' if item.is_active else ''
 		token_flag = 'yes' if item.has_auth_token else 'no'
 		print(
 			f' {item.index + 1:>2}  {item.name:<{name_width}}  {quota:>10}  '
-			f'{used:>10}  {item.provider:<12}  {token_flag:<5}  {current}'
+			f'{used:>10}  {status:<12}  {item.provider:<12}  {token_flag:<5}  {current}'
 		)
+	if failed:
+		print()
+		print('余额查询失败:')
+		for item in failed:
+			print(f'  - {item.name}: {item.error or "未知错误"}')
 	print()
 
 
@@ -610,7 +681,7 @@ async def cmd_switch(accounts: list[dict[str, Any]], index: int | None, *, plain
 						break
 				print('输入无效，请重试。')
 		else:
-			console.print('[dim]输入 q 退出[/]')
+			console.print(f'[dim]输入编号 [1-{len(accounts)}] 切换账号，输入 q 退出[/]')
 			while True:
 				choice = Prompt.ask(
 					'[bold cyan]选择要切换的账号[/]',

@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 _API_USER_PATTERN = re.compile(r'\d{5,10}')
+_GOB_ID_MARKER = b'id\x03int\x04'
+_GOB_ID_PREFIX = b'\x05\x00\xfd\x05'
 
 
 def decode_urlsafe_base64(value: str) -> bytes:
@@ -17,27 +19,47 @@ def decode_urlsafe_base64(value: str) -> bytes:
 	return base64.b64decode(normalized + padding)
 
 
+def _extract_gob_user_id(payload: bytes) -> int | None:
+	"""Read the numeric user id from the gob-encoded session payload."""
+	idx = payload.find(_GOB_ID_MARKER)
+	if idx < 0:
+		return None
+
+	pos = idx + len(_GOB_ID_MARKER)
+	if pos + 6 > len(payload) or payload[pos : pos + 4] != _GOB_ID_PREFIX:
+		return None
+
+	b4, b5 = payload[pos + 4], payload[pos + 5]
+	return 163840 + (b4 * 128) + (b5 // 2)
+
+
 def extract_api_user_from_session(session: str) -> str:
-	"""Extract api_user from a session cookie, same logic as milly.me generator."""
+	"""Extract api_user (New-Api-User) from a session cookie."""
 	session = session.strip()
 	if not session:
 		raise ValueError('Session cookie is empty')
 
 	try:
-		decoded = decode_urlsafe_base64(session).decode('utf-8', errors='replace')
-		parts = decoded.split('|')
+		decoded = decode_urlsafe_base64(session)
+		parts = decoded.split(b'|')
 		if len(parts) < 3:
 			raise ValueError('Session structure is invalid')
 
-		payload = decode_urlsafe_base64(parts[1]).decode('utf-8', errors='replace')
+		payload_bytes = decode_urlsafe_base64(parts[1].decode('ascii'))
 	except (ValueError, UnicodeDecodeError) as exc:
 		raise ValueError(f'Failed to decode session cookie: {exc}') from exc
 
+	user_id = _extract_gob_user_id(payload_bytes)
+	if user_id is not None:
+		return str(user_id)
+
+	# Fallback for unexpected payload layouts.
+	payload = payload_bytes.decode('utf-8', errors='replace')
 	matches = _API_USER_PATTERN.findall(payload)
 	if not matches:
 		raise ValueError('Could not extract api_user from session cookie')
 
-	return matches[0]
+	return matches[-1]
 
 
 def get_session_cookie(account: dict[str, Any]) -> str:
