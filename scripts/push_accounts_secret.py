@@ -99,7 +99,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def compact_json(data: list[dict[str, Any]]) -> str:
-	return json.dumps(data, separators=(',', ':'), ensure_ascii=False)
+	checkin_fields = ('name', 'cookies', 'api_user', 'provider')
+	payload = [{key: account[key] for key in checkin_fields if key in account} for account in data]
+	return json.dumps(payload, separators=(',', ':'), ensure_ascii=False)
 
 
 def ensure_gh_available() -> str:

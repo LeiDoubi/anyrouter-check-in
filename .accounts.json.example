@@ -3,13 +3,15 @@
         "name": "我的主账号",
         "cookies": {
             "session": "你的session值"
-        }
+        },
+        "auth_token": "sk-你的API令牌"
     },
     {
         "name": "备用账号",
         "provider": "agentrouter",
         "cookies": {
             "session": "你的session值"
-        }
+        },
+        "auth_token": "sk-你的API令牌"
     }
 ]

@@ -65,9 +65,16 @@ def parse_cookies(cookies_data):
 	return {}
 
 
-async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
+async def get_waf_cookies_with_playwright(
+	account_name: str,
+	login_url: str,
+	required_cookies: list[str],
+	*,
+	headless: bool = False,
+):
 	"""使用 Playwright 获取 WAF cookies（隐私模式）"""
-	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
+	mode = 'headless' if headless else 'headed'
+	print(f'[PROCESSING] {account_name}: Starting browser ({mode}) to get WAF cookies...')
 
 	async with async_playwright() as p:
 		import tempfile
@@ -75,7 +82,7 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 		with tempfile.TemporaryDirectory() as temp_dir:
 			context = await p.chromium.launch_persistent_context(
 				user_data_dir=temp_dir,
-				headless=False,
+				headless=headless,
 				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
 				viewport={'width': 1920, 'height': 1080},
 				args=[
@@ -151,13 +158,24 @@ def get_user_info(client, headers, user_info_url: str):
 		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
 
 
-async def prepare_cookies(account_name: str, provider_config, user_cookies: dict) -> dict | None:
+async def prepare_cookies(
+	account_name: str,
+	provider_config,
+	user_cookies: dict,
+	*,
+	headless: bool = False,
+) -> dict | None:
 	"""准备请求所需的 cookies（可能包含 WAF cookies）"""
 	waf_cookies = {}
 
 	if provider_config.needs_waf_cookies():
 		login_url = f'{provider_config.domain}{provider_config.login_path}'
-		waf_cookies = await get_waf_cookies_with_playwright(account_name, login_url, provider_config.waf_cookie_names)
+		waf_cookies = await get_waf_cookies_with_playwright(
+			account_name,
+			login_url,
+			provider_config.waf_cookie_names,
+			headless=headless,
+		)
 		if not waf_cookies:
 			print(f'[FAILED] {account_name}: Unable to get WAF cookies')
 			return None

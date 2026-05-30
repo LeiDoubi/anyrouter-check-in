@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "anyrouter-check-in"
 version = "0.1.0"
@@ -6,8 +10,18 @@ requires-python = ">=3.11"
 dependencies = [
   "httpx[http2]>=0.24.0",
   "playwright>=1.40.0",
-  "python-dotenv>=1.0.0"
+  "python-dotenv>=1.0.0",
+  "rich>=13.0.0"
 ]
+
+[project.scripts]
+anyrouter-accounts = "scripts.anyrouter_accounts:main"
+
+[tool.setuptools]
+py-modules = ["checkin"]
+
+[tool.setuptools.packages.find]
+include = ["scripts", "utils"]
 
 [dependency-groups]
 dev = [
