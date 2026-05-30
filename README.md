@@ -21,6 +21,8 @@
 - ✅ 单个/多账号自动签到
 - ✅ 多种机器人通知（可选）
 - ✅ 绕过 WAF 限制
+- ✅ 本地账号管理：一条命令查看各账号余额，并为 Claude Code / Codex 切换 `auth_token`
+- ✅ 一键同步：把本地 `.accounts.json` 与通知配置推送到 GitHub Actions Secrets（自动从 session 提取 `api_user`）
 
 ## 使用方法
 
@@ -47,6 +49,8 @@
 #### 获取 API User：
 
 按照下方图片教程操作获得。
+
+> 💡 如果使用下方「[本地配置与一键同步](#本地配置与一键同步推荐)」的方式，`api_user` 会自动从 session 中解析，无需手动获取。
 
 ### 3. 设置 GitHub Environment Secret
 
@@ -121,6 +125,115 @@
 3. 确认运行
 
 ![运行结果](./assets/check-in.png)
+
+## 本地配置与一键同步（推荐）
+
+除了在 GitHub 网页上逐个手动添加 Secret，你还可以在本地用一个 `.accounts.json` 文件统一管理所有账号，并通过脚本一键同步到 GitHub Actions。好处：
+
+- `api_user` 自动从 session 中解析，无需在 F12 里手动查找
+- 一条命令查看所有账号余额
+- 一条命令为本地 Claude Code / Codex 切换账号（自动写入 `ANTHROPIC_AUTH_TOKEN` / Codex `auth.json`）
+
+### 1. 安装依赖
+
+```bash
+uv sync
+uv run playwright install chromium
+```
+
+### 2. 创建 .accounts.json
+
+复制示例文件并填写（该文件已在 `.gitignore` 中，不会被提交）：
+
+```bash
+cp .accounts.json.example .accounts.json
+```
+
+```json
+[
+  {
+    "name": "我的主账号",
+    "cookies": {
+      "session": "你的 session 值"
+    },
+    "auth_token": "sk-你的API令牌"
+  },
+  {
+    "name": "备用账号",
+    "provider": "agentrouter",
+    "cookies": {
+      "session": "你的 session 值"
+    },
+    "auth_token": "sk-你的API令牌"
+  }
+]
+```
+
+**字段说明**：
+
+- `cookies.session`（必需）：登录后的 session 值，用于身份验证，并自动解析 `api_user`
+- `auth_token`（本地切换账号时必需）：Claude Code / Codex 使用的 API 令牌（形如 `sk-...`），**仅保存在本地，不会被推送到 GitHub**
+- `provider`（可选）：服务商，默认 `anyrouter`
+- `name`（可选）：账号显示名称
+
+> `api_user` 无需填写，脚本会自动从 `session` 中解析。
+
+### 3. 查看余额与切换账号
+
+```bash
+# 交互式：列出所有账号余额，按编号切换（默认行为）
+uv run anyrouter-accounts
+
+# 仅列出账号与余额
+uv run anyrouter-accounts list
+
+# 切换到第 2 个账号
+uv run anyrouter-accounts switch 2
+
+# 查看当前激活账号
+uv run anyrouter-accounts current
+```
+
+切换账号后，脚本会：
+
+- 写入 `~/.config/anyrouter-check-in/env.sh`（包含 `ANTHROPIC_AUTH_TOKEN` 与 `ANTHROPIC_BASE_URL`）
+- 写入 Codex 配置 `~/.codex/auth.json` 与 `~/.codex/config.toml`
+- 在 `~/.zshrc` 中加入 `source env.sh`，并清理冲突的 `ANTHROPIC_*` 变量
+
+当前终端立即生效：
+
+```bash
+source ~/.config/anyrouter-check-in/env.sh
+```
+
+新开终端会自动加载。
+
+> 账号文件查找顺序：`-f` 指定的文件 → 环境变量 `ANYROUTER_ACCOUNTS_FILE` → 当前目录 `./.accounts.json` → `~/.config/anyrouter-check-in/accounts.json` → 项目根目录 `./.accounts.json`。
+
+### 4. 一键同步到 GitHub Actions
+
+把 `.accounts.json`（自动刷新 `api_user`，并**移除 `auth_token`**）推送到 `ANYROUTER_ACCOUNTS`，同时将 `.env` 中的通知配置推送为对应的 Secret：
+
+```bash
+# 预览将要推送的内容，不实际写入
+uv run python scripts/push_accounts_secret.py --dry-run
+
+# 推送到 origin 仓库的 production 环境
+uv run python scripts/push_accounts_secret.py
+
+# 推送的同时，把刷新后的 api_user 写回本地 .accounts.json
+uv run python scripts/push_accounts_secret.py --write
+```
+
+**前置条件**：已安装并登录 [GitHub CLI](https://cli.github.com/)（`gh auth login`）。
+
+**常用参数**：
+
+- `-R, --repo OWNER/REPO`：指定目标仓库（默认取 `origin` 远程）
+- `-e, --env`：GitHub 环境名称（默认 `production`）
+- `--env-file`：通知配置文件（默认 `.env`，参考 `.env.example`）
+- `--no-auto-api-user`：不自动解析 `api_user`（需在文件中手动提供）
+- `--dry-run`：仅校验与预览，不实际推送
 
 ## 执行时间
 
@@ -325,6 +438,7 @@
 1. 在仓库的 Settings -> Environments -> production -> Environment secrets 中添加上述环境变量
 2. 每个通知方式都是独立的，可以只配置你需要的推送方式
 3. 如果某个通知方式配置不正确或未配置，脚本会自动跳过该通知方式
+4. 如果使用上方的「本地配置与一键同步」，也可以把这些变量写进 `.env`（参考 `.env.example`），运行 `push_accounts_secret.py` 时会自动同步到 GitHub
 
 ## 故障排除
 
@@ -338,7 +452,9 @@
 
 ## 本地开发环境设置
 
-如果你需要在本地测试或开发，请按照以下步骤设置：
+如果你需要在本地测试或开发签到脚本本身，请按照以下步骤设置：
+
+> 仅想在本地管理账号、查看余额或为 Claude Code / Codex 切换账号？请看上方「本地配置与一键同步」一节。
 
 ```bash
 # 安装所有依赖
