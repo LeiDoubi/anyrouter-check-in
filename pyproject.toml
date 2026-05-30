@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 anyrouter-accounts = "scripts.anyrouter_accounts:main"
+linuxdo-browser = "scripts.linuxdo_browser:main"
 
 [tool.setuptools]
 py-modules = ["checkin"]
