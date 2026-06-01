@@ -423,8 +423,20 @@ async def fetch_account_balance(
 			has_auth_token=has_auth_token,
 		)
 
-	with suppress_checkin_logs():
-		all_cookies = await prepare_cookies(name, provider_config, user_cookies, headless=True)
+	try:
+		with suppress_checkin_logs():
+			all_cookies = await prepare_cookies(name, provider_config, user_cookies, headless=True)
+	except RuntimeError as exc:
+		return AccountBalance(
+			index=index,
+			name=name,
+			provider=provider_name,
+			quota=None,
+			used_quota=None,
+			error=str(exc).split('\n')[0],
+			is_active=index == active_index,
+			has_auth_token=has_auth_token,
+		)
 	if not all_cookies:
 		return AccountBalance(
 			index=index,

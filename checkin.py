@@ -7,12 +7,13 @@ import asyncio
 import hashlib
 import json
 import os
+import platform
 import sys
 from datetime import datetime
 
 import httpx
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+from playwright.async_api import BrowserContext, Playwright, async_playwright
 
 from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.notify import notify
@@ -65,6 +66,50 @@ def parse_cookies(cookies_data):
 	return {}
 
 
+WAF_LAUNCH_ARGS = [
+	'--disable-blink-features=AutomationControlled',
+	*(
+		['--disable-dev-shm-usage', '--no-sandbox']
+		if platform.system() == 'Linux'
+		else []
+	),
+]
+
+
+async def _launch_waf_browser_context(
+	playwright: Playwright,
+	*,
+	user_data_dir: str,
+	headless: bool,
+) -> BrowserContext:
+	"""Launch browser for WAF cookie fetch; prefer system Chrome on macOS."""
+	kwargs = {
+		'user_data_dir': user_data_dir,
+		'headless': headless,
+		'viewport': {'width': 1920, 'height': 1080},
+		'args': WAF_LAUNCH_ARGS,
+		'ignore_default_args': ['--enable-automation'],
+	}
+
+	if platform.system() == 'Darwin':
+		try:
+			return await playwright.chromium.launch_persistent_context(channel='chrome', **kwargs)
+		except Exception:
+			pass
+
+	try:
+		return await playwright.chromium.launch_persistent_context(**kwargs)
+	except Exception as exc:
+		message = str(exc)
+		if "Executable doesn't exist" in message or 'playwright install' in message.lower():
+			raise RuntimeError(
+				'未找到 Playwright 浏览器。请在本项目目录执行:\n'
+				'  uv run playwright install chromium\n'
+				'或在 macOS 上安装 Google Chrome 后重试。'
+			) from exc
+		raise
+
+
 async def get_waf_cookies_with_playwright(
 	account_name: str,
 	login_url: str,
@@ -80,18 +125,10 @@ async def get_waf_cookies_with_playwright(
 		import tempfile
 
 		with tempfile.TemporaryDirectory() as temp_dir:
-			context = await p.chromium.launch_persistent_context(
+			context = await _launch_waf_browser_context(
+				p,
 				user_data_dir=temp_dir,
 				headless=headless,
-				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-				viewport={'width': 1920, 'height': 1080},
-				args=[
-					'--disable-blink-features=AutomationControlled',
-					'--disable-dev-shm-usage',
-					'--disable-web-security',
-					'--disable-features=VizDisplayCompositor',
-					'--no-sandbox',
-				],
 			)
 
 			page = await context.new_page()
