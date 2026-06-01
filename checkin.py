@@ -234,42 +234,35 @@ def format_check_in_notification(detail: dict) -> str:
 	Returns:
 		格式化后的通知消息
 	"""
-	lines = [
-		f'[CHECK-IN] {detail["name"]}',
-		'  ━━━━━━━━━━━━━━━━━━━━',
-		'  📍 签到前',
-		f'     💵 余额: ${detail["before_quota"]:.2f}  |  📊 累计消耗: ${detail["before_used"]:.2f}',
-		'  📍 签到后',
-		f'     💵 余额: ${detail["after_quota"]:.2f}  |  📊 累计消耗: ${detail["after_used"]:.2f}',
-	]
-
-	# 判断是否有变化
 	has_reward = detail['check_in_reward'] != 0
 	has_usage = detail['usage_increase'] != 0
+	before_quota = detail['before_quota']
+	after_quota = detail['after_quota']
 
-	if has_reward or has_usage:
-		lines.append('  ━━━━━━━━━━━━━━━━━━━━')
-
-		# 已签到但期间有使用
-		if not has_reward and has_usage:
-			lines.append('  ℹ️  今日已签到（期间有使用）')
-
-		# 签到获得
-		if has_reward:
-			lines.append(f'  🎁 签到获得: +${detail["check_in_reward"]:.2f}')
-
-		# 期间消耗
-		if has_usage:
-			lines.append(f'  📉 期间消耗: ${detail["usage_increase"]:.2f}')
-
-		# 余额变化
-		if detail['balance_change'] != 0:
-			change_symbol = '+' if detail['balance_change'] > 0 else ''
-			change_emoji = '📈' if detail['balance_change'] > 0 else '📉'
-			lines.append(f'  {change_emoji} 余额变化: {change_symbol}${detail["balance_change"]:.2f}')
+	# 标题行：有签到收益用 ✅；今日已签到（无新收益）用 ℹ️
+	if has_reward:
+		lines = [f'**✅ {detail["name"]}**']
 	else:
-		# 无任何变化
-		lines.extend(['  ━━━━━━━━━━━━━━━━━━━━', '  ℹ️  今日已签到，无变化'])
+		note = '（今日已签到）' if has_usage else '（今日已签到，无变化）'
+		lines = [f'**ℹ️ {detail["name"]}** {note}']
+
+	# 余额行：用箭头表达「签到前 → 签到后」，省去单独的「余额变化」
+	balance_parts = []
+	if before_quota != after_quota:
+		balance_parts.append(f'余额 ${before_quota:.2f} → **${after_quota:.2f}**')
+	else:
+		balance_parts.append(f'余额 **${after_quota:.2f}**')
+	if has_reward:
+		balance_parts.append(f'🎁 +${detail["check_in_reward"]:.2f}')
+	if has_usage:
+		balance_parts.append(f'📉 期间消耗 ${detail["usage_increase"]:.2f}')
+	lines.append('　'.join(balance_parts))
+
+	# 累计消耗：有期间消耗时用箭头展示变化，否则只显示一次
+	if has_usage:
+		lines.append(f'累计消耗 ${detail["before_used"]:.2f} → ${detail["after_used"]:.2f}')
+	else:
+		lines.append(f'累计消耗 ${detail["after_used"]:.2f}')
 
 	return '\n'.join(lines)
 
@@ -419,19 +412,22 @@ async def main():
 
 			if should_notify_this_account:
 				account_name = account.get_display_name(i)
-				status = '[SUCCESS]' if success else '[FAIL]'
-				account_result = f'{status} {account_name}'
+				account_lines = [f'**❌ {account_name}**']
 				if user_info_after and user_info_after.get('success'):
-					account_result += f'\n{user_info_after["display"]}'
+					account_lines.append(
+						f'余额 **${user_info_after["quota"]:.2f}**　累计消耗 ${user_info_after["used_quota"]:.2f}'
+					)
 				elif user_info_after:
-					account_result += f'\n{user_info_after.get("error", "Unknown error")}'
-				notification_content.append(account_result)
+					account_lines.append(user_info_after.get('error', '未知错误'))
+				else:
+					account_lines.append('签到失败，未获取到账号信息')
+				notification_content.append('\n'.join(account_lines))
 
 		except Exception as e:
 			account_name = account.get_display_name(i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
 			need_notify = True  # 异常也需要通知
-			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+			notification_content.append(f'**❌ {account_name}**\n异常: {str(e)[:50]}')
 
 	# 检查余额变化
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
@@ -470,22 +466,17 @@ async def main():
 
 	if need_notify and notification_content:
 		# 构建通知内容
-		summary = [
-			'[STATS] Check-in result statistics:',
-			f'[SUCCESS] Success: {success_count}/{total_count}',
-			f'[FAIL] Failed: {total_count - success_count}/{total_count}',
-		]
-
+		failed_count = total_count - success_count
 		if success_count == total_count:
-			summary.append('[SUCCESS] All accounts check-in successful!')
+			summary_line = f'**📊 全部成功 {success_count}/{total_count}**'
 		elif success_count > 0:
-			summary.append('[WARN] Some accounts check-in successful')
+			summary_line = f'**📊 成功 {success_count}/{total_count} ｜ 失败 {failed_count}/{total_count}**'
 		else:
-			summary.append('[ERROR] All accounts check-in failed')
+			summary_line = f'**📊 全部失败 {failed_count}/{total_count}**'
 
-		time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+		time_info = f'🕐 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
 
-		notify_content = '\n\n'.join([time_info, '\n'.join(notification_content), '\n'.join(summary)])
+		notify_content = '\n\n'.join([time_info, '\n\n'.join(notification_content), summary_line])
 
 		print(notify_content)
 		notify.push_message('AnyRouter Check-in Alert', notify_content, msg_type='text')
