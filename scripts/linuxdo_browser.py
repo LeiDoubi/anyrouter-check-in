@@ -26,14 +26,19 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from scripts.linuxdo_planner import TrustLevelPlanner
+from scripts.linuxdo_store import Account, AccountStore
+
 console = Console()
 error_console = Console(stderr=True)
 
 BASE_URL = 'https://linux.do'
 CONFIG_DIR = Path.home() / '.config' / 'linuxdo-browser'
-PROFILE_DIR = CONFIG_DIR / 'profile'
+LEGACY_PROFILE_DIR = CONFIG_DIR / 'profile'
+PROFILES_DIR = CONFIG_DIR / 'profiles'
 CONFIG_FILE = CONFIG_DIR / 'config.json'
 STATE_FILE = CONFIG_DIR / 'state.json'
+DB_FILE = CONFIG_DIR / 'linuxdo.sqlite3'
 
 TOPIC_ID_PATTERN = re.compile(r'/t/topic/(\d+)')
 
@@ -120,6 +125,11 @@ class BrowserConfig:
 	stuck_timeout_sec: int = 30
 	use_chrome: bool = True
 	human_verify_timeout_sec: int = 300
+	target_level: int = 2
+	daily_topic_limit: int = 50
+	daily_like_limit: int = 30
+	run_all_cooldown_min_sec: int = 30
+	run_all_cooldown_max_sec: int = 90
 
 	def validate(self) -> None:
 		if self.speed not in SPEED_PRESETS:
@@ -128,6 +138,8 @@ class BrowserConfig:
 			raise ValueError(f'Unknown list type: {self.list_type}')
 		if self.like_chance not in LIKE_CHANCE_PRESETS:
 			raise ValueError(f'Unknown like chance preset: {self.like_chance}')
+		if self.target_level < 1 or self.target_level > 4:
+			raise ValueError(f'target_level must be between 1 and 4: {self.target_level}')
 
 	@property
 	def speed_config(self) -> dict[str, Any]:
@@ -150,6 +162,7 @@ class BrowserState:
 	session_viewed: int = 0
 	session_liked: int = 0
 	session_replies: int = 0
+	persist_file: bool = True
 
 	@classmethod
 	def load(cls) -> BrowserState:
@@ -165,7 +178,19 @@ class BrowserState:
 		except (json.JSONDecodeError, TypeError, ValueError):
 			return cls()
 
+	@classmethod
+	def load_for_account(cls, store: AccountStore, account: Account) -> BrowserState:
+		metrics = store.aggregate_metrics(account.id)
+		return cls(
+			viewed_topics=store.viewed_topics(account.id),
+			liked_posts=store.liked_posts(account.id),
+			total_replies=int(metrics.get('posts_read', 0)),
+			persist_file=False,
+		)
+
 	def save(self) -> None:
+		if not self.persist_file:
+			return
 		CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 		payload = {
 			'viewed_topics': sorted(self.viewed_topics),
@@ -222,15 +247,29 @@ def page_type_from_url(url: str) -> str:
 
 
 class LinuxDoBrowser:
-	def __init__(self, config: BrowserConfig, state: BrowserState) -> None:
+	def __init__(
+		self,
+		config: BrowserConfig,
+		state: BrowserState,
+		account: Account | None = None,
+		store: AccountStore | None = None,
+	) -> None:
 		self.config = config
 		self.state = state
+		self.account = account
+		self.store = store
 		self.running = False
 		self.last_activity = time.monotonic()
 		self.last_like_time = 0.0
 		self.like_disabled = not config.enable_like
 		self._context: BrowserContext | None = None
 		self._page: Page | None = None
+
+	@property
+	def profile_dir(self) -> Path:
+		if self.account is not None:
+			return Path(self.account.profile_dir)
+		return LEGACY_PROFILE_DIR
 
 	def heartbeat(self) -> None:
 		self.last_activity = time.monotonic()
@@ -239,9 +278,9 @@ class LinuxDoBrowser:
 		console.log(f'[cyan]linuxdo[/] {message}')
 
 	async def launch(self, playwright: Playwright) -> Page:
-		PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+		self.profile_dir.mkdir(parents=True, exist_ok=True)
 		context_kwargs: dict[str, Any] = {
-			'user_data_dir': str(PROFILE_DIR),
+			'user_data_dir': str(self.profile_dir),
 			'headless': self.config.headless,
 			'viewport': {'width': 1360, 'height': 900},
 			'locale': 'zh-CN',
@@ -394,7 +433,7 @@ class LinuxDoBrowser:
 				'1. 勾选 hCaptcha「I am human」\n'
 				'2. 脚本会在验证完成后自动点击 [bold]Verify[/]\n'
 				'3. 若仍无法点击，请删除 profile 后重试:\n'
-				f'   [dim]rm -rf {PROFILE_DIR}[/]',
+				f'   [dim]rm -rf {self.profile_dir}[/]',
 				title='人机验证',
 				border_style='yellow',
 			)
@@ -431,8 +470,21 @@ class LinuxDoBrowser:
 		await sleep_range((1500, 2500))
 		await self.handle_human_verification()
 		if await self.is_logged_in():
+			if self.store is not None and self.account is not None:
+				self.store.update_username(self.account.id, await self.get_current_username())
 			return
 		raise RuntimeError('未检测到登录状态，请先运行: linuxdo-browser login')
+
+	async def get_current_username(self) -> str | None:
+		return await self.page.evaluate(
+			"""() => {
+				const avatar = document.querySelector('#current-user img.avatar, .current-user-avatar img.avatar');
+				const title = avatar?.getAttribute('title') || avatar?.getAttribute('alt');
+				if (title) return title.replace(/^@/, '').trim();
+				const user = document.querySelector('#current-user, #toggle-current-user, li.current-user');
+				return user?.getAttribute('data-username') || null;
+			}"""
+		)
 
 	async def get_csrf_token(self) -> str:
 		token = await self.page.locator('meta[name="csrf-token"]').get_attribute('content')
@@ -506,6 +558,8 @@ class LinuxDoBrowser:
 		self.state.liked_posts.add(post_key)
 		self.state.session_liked += 1
 		self.last_like_time = time.monotonic()
+		if self.store is not None and self.account is not None:
+			self.store.record_event(self.account.id, 'like_given', post_id=post_key)
 		self.state.save()
 		self.log(f'点赞帖子 #{post_key}')
 		self.heartbeat()
@@ -577,12 +631,15 @@ class LinuxDoBrowser:
 		speed = self.config.speed_config
 		topic_url = f'{BASE_URL}/t/topic/{topic_id}/1'
 		self.log(f'浏览话题 {topic_id}')
+		topic_started = time.monotonic()
 		await self.page.goto(topic_url, wait_until='domcontentloaded')
 		await sleep_range((1500, 2500))
 
 		if topic_id not in self.state.viewed_topics:
 			self.state.viewed_topics.add(topic_id)
 			self.state.session_viewed += 1
+			if self.store is not None and self.account is not None:
+				self.store.record_event(self.account.id, 'topic_view', topic_id=topic_id)
 			self.state.save()
 
 		await self.scroll_to_top()
@@ -615,6 +672,8 @@ class LinuxDoBrowser:
 				viewed_posts.add(post_key)
 				self.state.session_replies += 1
 				self.state.total_replies += 1
+				if self.store is not None and self.account is not None:
+					self.store.record_event(self.account.id, 'post_read', topic_id=topic_id, post_id=post_key)
 				if self.state.session_replies % 10 == 0:
 					self.state.save()
 				self.heartbeat()
@@ -645,6 +704,10 @@ class LinuxDoBrowser:
 
 			await self.scroll_down()
 			await sleep_range(tuple(speed['scroll_interval_ms']))
+
+		read_minutes = int((time.monotonic() - topic_started) // 60)
+		if read_minutes > 0 and self.store is not None and self.account is not None:
+			self.store.record_event(self.account.id, 'read_minute', topic_id=topic_id, value=read_minutes)
 
 		await sleep_range((self.config.return_to_list_delay_ms, int(self.config.return_to_list_delay_ms * 1.5)))
 
@@ -765,10 +828,19 @@ def build_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description='Linux.do auto browsing helper (Playwright)')
 	subparsers = parser.add_subparsers(dest='command')
 
+	accounts_parser = subparsers.add_parser('accounts', help='Manage Linux.do accounts')
+	accounts_subparsers = accounts_parser.add_subparsers(dest='accounts_command')
+	accounts_add = accounts_subparsers.add_parser('add', help='Add an account and open login browser')
+	accounts_add.add_argument('name', help='Account display name')
+	accounts_add.add_argument('--target-level', type=int, default=2, help='Target trust level (1-4)')
+	accounts_subparsers.add_parser('list', help='List accounts')
+
 	login_parser = subparsers.add_parser('login', help='Open browser and save login session')
+	login_parser.add_argument('--account', help='Account name or slug')
 	login_parser.add_argument('--headless', action='store_true', help='Run browser headless (not recommended)')
 
 	run_parser = subparsers.add_parser('run', help='Start auto browsing')
+	run_parser.add_argument('--account', help='Account name or slug')
 	run_parser.add_argument('--speed', choices=list(SPEED_PRESETS), help='Speed preset')
 	run_parser.add_argument('--list', choices=list(LIST_OPTIONS), dest='list_type', help='Topic list type')
 	run_parser.add_argument('--like', dest='enable_like', action=argparse.BooleanOptionalAction, help='Enable random likes')
@@ -776,12 +848,30 @@ def build_parser() -> argparse.ArgumentParser:
 	run_parser.add_argument('--max-topics', type=int, help='Max topics per session')
 	run_parser.add_argument('--headless', action='store_true', help='Run browser headless')
 
-	subparsers.add_parser('stats', help='Show browsing stats')
-	subparsers.add_parser('clear', help='Clear browsing history')
+	run_all_parser = subparsers.add_parser('run-all', help='Run all enabled accounts')
+	run_all_parser.add_argument('--speed', choices=list(SPEED_PRESETS), help='Speed preset')
+	run_all_parser.add_argument('--list', choices=list(LIST_OPTIONS), dest='list_type', help='Topic list type')
+	run_all_parser.add_argument('--like', dest='enable_like', action=argparse.BooleanOptionalAction, help='Enable random likes')
+	run_all_parser.add_argument('--like-chance', choices=list(LIKE_CHANCE_PRESETS), help='Like probability preset')
+	run_all_parser.add_argument('--max-topics', type=int, help='Max topics per account')
+	run_all_parser.add_argument('--headless', action='store_true', help='Run browser headless')
+
+	stats_parser = subparsers.add_parser('stats', help='Show browsing stats')
+	stats_parser.add_argument('--account', help='Account name or slug')
+	status_parser = subparsers.add_parser('status', help='Show trust-level progress')
+	status_parser.add_argument('--account', help='Account name or slug')
+	reply_parser = subparsers.add_parser('reply', help='Record manual replies')
+	reply_subparsers = reply_parser.add_subparsers(dest='reply_command')
+	reply_mark = reply_subparsers.add_parser('mark', help='Mark a topic as manually replied')
+	reply_mark.add_argument('topic_id', help='Linux.do topic id')
+	reply_mark.add_argument('--account', help='Account name or slug')
+	clear_parser = subparsers.add_parser('clear', help='Clear browsing history')
+	clear_parser.add_argument('--account', help='Account name or slug')
 
 	subparsers.add_parser('config', help='Show current config')
 
 	import_parser = subparsers.add_parser('import-cookies', help='Import cookies from normal browser (skip login)')
+	import_parser.add_argument('--account', help='Account name or slug')
 	import_parser.add_argument('cookies', nargs='?', help='Cookie string: name1=val1; name2=val2')
 	import_parser.add_argument('--file', '-f', help='Read cookies from file')
 
@@ -804,14 +894,76 @@ def apply_cli_overrides(config: BrowserConfig, args: argparse.Namespace) -> None
 	config.validate()
 
 
+def get_store() -> AccountStore:
+	store = AccountStore(DB_FILE, PROFILES_DIR)
+	store.init_db()
+	return store
+
+
+def resolve_account(store: AccountStore, name_or_slug: str | None) -> Account:
+	account = store.get_account(name_or_slug) if name_or_slug else store.get_or_create_default_account()
+	if account.slug == 'default' and Path(account.profile_dir) == PROFILES_DIR / 'default' and LEGACY_PROFILE_DIR.exists():
+		store.update_profile_dir(account.id, LEGACY_PROFILE_DIR)
+		account = store.get_account(account.slug)
+	return account
+
+
+def migrate_legacy_state(store: AccountStore, account: Account) -> None:
+	if not STATE_FILE.is_file():
+		return
+	if store.viewed_topics(account.id) or store.liked_posts(account.id):
+		return
+	state = BrowserState.load()
+	for topic_id in state.viewed_topics:
+		store.record_event(account.id, 'topic_view', topic_id=topic_id)
+	for post_id in state.liked_posts:
+		store.record_event(account.id, 'like_given', post_id=post_id)
+	for _ in range(state.total_replies):
+		store.record_event(account.id, 'post_read')
+
+
+def build_browser_for_account(config: BrowserConfig, store: AccountStore, account: Account) -> LinuxDoBrowser:
+	migrate_legacy_state(store, account)
+	state = BrowserState.load_for_account(store, account)
+	return LinuxDoBrowser(config, state, account=account, store=store)
+
+
+def latest_metrics(store: AccountStore, account: Account) -> dict[str, Any]:
+	metrics = store.aggregate_metrics(account.id)
+	snapshot = store.latest_snapshot(account.id)
+	if snapshot is not None:
+		metrics.update(
+			{
+				'level': snapshot.level,
+				'days_visited': max(int(metrics.get('days_visited', 0)), snapshot.days_visited),
+				'topics_entered': max(int(metrics.get('topics_entered', 0)), snapshot.topics_entered),
+				'posts_read': max(int(metrics.get('posts_read', 0)), snapshot.posts_read),
+				'read_minutes': max(int(metrics.get('read_minutes', 0)), snapshot.read_minutes),
+				'likes_given': max(int(metrics.get('likes_given', 0)), snapshot.likes_given),
+				'likes_received': snapshot.likes_received,
+				'replied_topics': max(int(metrics.get('replied_topics', 0)), snapshot.replied_topics),
+				'flags_received': snapshot.flags_received,
+				'suspended_or_silenced': snapshot.suspended_or_silenced,
+			}
+		)
+	metrics.setdefault('days_visited_100d', metrics.get('days_visited', 0))
+	metrics.setdefault('recent_topics_viewed', metrics.get('topics_entered', 0))
+	metrics.setdefault('recent_posts_read', metrics.get('posts_read', 0))
+	metrics.setdefault('manual_promotion', False)
+	metrics.setdefault('level', TrustLevelPlanner(metrics).current_level())
+	return metrics
+
+
 async def cmd_login(args: argparse.Namespace) -> int:
 	config = load_config()
 	if args.headless:
 		config.headless = True
 	save_config(config)
+	store = get_store()
+	account = resolve_account(store, getattr(args, 'account', None))
 
 	async with async_playwright() as playwright:
-		browser = LinuxDoBrowser(config, BrowserState.load())
+		browser = build_browser_for_account(config, store, account)
 		page = await browser.launch(playwright)
 		await page.goto(f'{BASE_URL}/latest', wait_until='domcontentloaded')
 		await browser.handle_human_verification()
@@ -835,6 +987,7 @@ async def cmd_login(args: argparse.Namespace) -> int:
 				await verify_task
 		await browser.handle_human_verification()
 		if await browser.is_logged_in():
+			store.update_username(account.id, await browser.get_current_username())
 			console.print('[green]✓ 登录状态已保存[/]')
 		else:
 			console.print('[yellow]未检测到登录元素，session 仍会保存，运行 run 时再验证[/]')
@@ -871,13 +1024,16 @@ async def cmd_import_cookies(args: argparse.Namespace) -> int:
 		return 1
 
 	config = load_config()
+	store = get_store()
+	account = resolve_account(store, getattr(args, 'account', None))
 	async with async_playwright() as playwright:
-		browser = LinuxDoBrowser(config, BrowserState.load())
+		browser = build_browser_for_account(config, store, account)
 		await browser.launch(playwright)
 		await browser.context.add_cookies(cast(Any, cookies))
 		await browser.page.goto(f'{BASE_URL}/latest', wait_until='domcontentloaded')
 		await browser.handle_human_verification()
 		if await browser.is_logged_in():
+			store.update_username(account.id, await browser.get_current_username())
 			console.print(f'[green]✓ 已导入 {len(cookies)} 个 Cookie 并验证登录成功[/]')
 		else:
 			console.print(f'[yellow]已导入 {len(cookies)} 个 Cookie，但未检测到登录状态，Cookie 可能已过期[/]')
@@ -889,11 +1045,14 @@ async def cmd_run(args: argparse.Namespace) -> int:
 	config = load_config()
 	apply_cli_overrides(config, args)
 	save_config(config)
-	state = BrowserState.load()
-	browser = LinuxDoBrowser(config, state)
+	store = get_store()
+	account = resolve_account(store, getattr(args, 'account', None))
+	browser = build_browser_for_account(config, store, account)
+	run_id = store.start_run(account.id)
 
 	console.print(
 		Panel(
+			f'账号: [cyan]{account.name}[/]  '
 			f'速度: [cyan]{config.speed}[/]  列表: [cyan]{config.list_type}[/]  '
 			f'点赞: [cyan]{"开" if config.enable_like else "关"}[/]  '
 			f'概率: [cyan]{config.like_chance}[/]',
@@ -909,39 +1068,89 @@ async def cmd_run(args: argparse.Namespace) -> int:
 			await browser.close()
 	except KeyboardInterrupt:
 		browser.stop()
-		state.save()
+		store.finish_run(
+			run_id,
+			'stopped',
+			topics_viewed=browser.state.session_viewed,
+			posts_read=browser.state.session_replies,
+			likes_given=browser.state.session_liked,
+		)
 		console.print('\n[dim]已停止[/]')
 	except RuntimeError as exc:
+		store.finish_run(run_id, 'error', error=str(exc))
 		error_console.print(f'[bold red]ERROR:[/] {exc}')
 		return 1
 	except TimeoutError as exc:
+		store.finish_run(run_id, 'timeout', error=str(exc))
 		error_console.print(f'[bold red]TIMEOUT:[/] {exc}')
 		return 1
+	else:
+		store.finish_run(
+			run_id,
+			'success',
+			topics_viewed=browser.state.session_viewed,
+			posts_read=browser.state.session_replies,
+			likes_given=browser.state.session_liked,
+		)
+	finally:
+		store.record_snapshot(account.id, latest_metrics(store, account))
 
 	browser.print_stats()
+	cmd_status_for_account(store, account)
 	return 0
 
 
-def cmd_stats() -> int:
-	state = BrowserState.load()
+async def cmd_run_all(args: argparse.Namespace) -> int:
 	config = load_config()
-	table = Table(title='Linux.do 浏览记录', header_style='bold cyan')
+	apply_cli_overrides(config, args)
+	save_config(config)
+	store = get_store()
+	accounts = [account for account in store.list_accounts() if account.enabled]
+	if not accounts:
+		error_console.print('[bold red]没有可运行的账号，请先执行 accounts add[/]')
+		return 1
+
+	exit_code = 0
+	for index, account in enumerate(accounts):
+		args.account = account.slug
+		code = await cmd_run(args)
+		exit_code = max(exit_code, code)
+		if index < len(accounts) - 1:
+			delay = random.randint(config.run_all_cooldown_min_sec, config.run_all_cooldown_max_sec)
+			console.print(f'[dim]账号间冷却 {delay}s[/]')
+			await asyncio.sleep(delay)
+	return exit_code
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+	store = get_store()
+	account = resolve_account(store, getattr(args, 'account', None))
+	metrics = latest_metrics(store, account)
+	table = Table(title=f'Linux.do 浏览记录 - {account.name}', header_style='bold cyan')
 	table.add_column('项目')
 	table.add_column('数量', justify='right')
-	table.add_row('已浏览话题', str(len(state.viewed_topics)))
-	table.add_row('已点赞帖子', str(len(state.liked_posts)))
-	table.add_row('累计浏览回复', str(state.total_replies))
+	table.add_row('已浏览话题', str(metrics.get('topics_entered', 0)))
+	table.add_row('已点赞帖子', str(metrics.get('likes_given', 0)))
+	table.add_row('累计浏览回复', str(metrics.get('posts_read', 0)))
+	table.add_row('累计阅读分钟', str(metrics.get('read_minutes', 0)))
 	console.print(table)
+	config = load_config()
 	console.print(
 		f'当前配置: speed={config.speed}, list={config.list_type}, like={config.enable_like}, chance={config.like_chance}'
 	)
 	return 0
 
 
-def cmd_clear() -> int:
-	state = BrowserState.load()
-	state.clear()
-	console.print('[green]已清除浏览记录[/]')
+def cmd_clear(args: argparse.Namespace) -> int:
+	if getattr(args, 'account', None):
+		store = get_store()
+		account = resolve_account(store, args.account)
+		store.clear_account_events(account.id)
+		console.print(f'[green]已清除账号 {account.name} 的浏览记录[/]')
+	else:
+		state = BrowserState.load()
+		state.clear()
+		console.print('[green]已清除旧版默认浏览记录[/]')
 	return 0
 
 
@@ -951,16 +1160,114 @@ def cmd_config() -> int:
 	return 0
 
 
+async def cmd_accounts(args: argparse.Namespace) -> int:
+	store = get_store()
+	subcommand = args.accounts_command or 'list'
+	if subcommand == 'add':
+		try:
+			account = store.add_account(args.name, target_level=args.target_level)
+		except ValueError as exc:
+			error_console.print(f'[bold red]ERROR:[/] {exc}')
+			return 1
+		console.print(f'[green]已添加账号:[/] {account.name} ({account.slug})')
+		console.print(f'[dim]登录目录: {account.profile_dir}[/]')
+		args.account = account.slug
+		args.headless = getattr(args, 'headless', False)
+		return await cmd_login(args)
+	if subcommand == 'list':
+		table = Table(title='Linux.do 账号', header_style='bold cyan')
+		table.add_column('ID', justify='right')
+		table.add_column('名称')
+		table.add_column('Slug')
+		table.add_column('用户名')
+		table.add_column('目标等级', justify='right')
+		table.add_column('Profile')
+		for account in store.list_accounts():
+			table.add_row(
+				str(account.id),
+				account.name,
+				account.slug,
+				account.username or '-',
+				str(account.target_level),
+				account.profile_dir,
+			)
+		console.print(table)
+		return 0
+	error_console.print(f'[bold red]未知 accounts 命令:[/] {subcommand}')
+	return 1
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+	store = get_store()
+	account = resolve_account(store, getattr(args, 'account', None))
+	cmd_status_for_account(store, account)
+	return 0
+
+
+def cmd_reply(args: argparse.Namespace) -> int:
+	if (args.reply_command or 'mark') != 'mark':
+		error_console.print(f'[bold red]未知 reply 命令:[/] {args.reply_command}')
+		return 1
+	store = get_store()
+	account = resolve_account(store, getattr(args, 'account', None))
+	topic_id = str(args.topic_id).strip()
+	if not topic_id:
+		error_console.print('[bold red]请提供 topic_id[/]')
+		return 1
+	store.record_event(account.id, 'manual_reply', topic_id=topic_id)
+	console.print(f'[green]已记录账号 {account.name} 手动回复话题 {topic_id}[/]')
+	cmd_status_for_account(store, account)
+	return 0
+
+
+def cmd_status_for_account(store: AccountStore, account: Account) -> None:
+	metrics = latest_metrics(store, account)
+	planner = TrustLevelPlanner(metrics)
+	next_level = planner.next_level(account.target_level)
+	table = Table(title=f'升级进度 - {account.name}', header_style='bold cyan')
+	table.add_column('等级', justify='right')
+	table.add_column('要求')
+	table.add_column('当前', justify='right')
+	table.add_column('缺口', justify='right')
+	table.add_column('状态')
+	for status in planner.statuses_for_level(next_level):
+		remaining = '-' if status.remaining is None else str(status.remaining)
+		state = '完成' if status.done else ('需人工' if status.requirement.manual else '待完成')
+		table.add_row(
+			str(status.requirement.level),
+			status.requirement.label,
+			str(status.current),
+			remaining,
+			state,
+		)
+	console.print(table)
+	actions = planner.recommended_actions(account.target_level)
+	if actions:
+		console.print(
+			'[dim]建议: '
+			+ ', '.join(f'{key}={value}' for key, value in actions.items())
+			+ '[/]'
+		)
+
+
 async def async_main(args: argparse.Namespace) -> int:
 	command = args.command or 'run'
+	if command == 'accounts':
+		return await cmd_accounts(args)
 	if command == 'login':
 		return await cmd_login(args)
 	if command == 'run':
 		return await cmd_run(args)
+	if command == 'run-all':
+		return await cmd_run_all(args)
 	if command == 'stats':
-		return cmd_stats()
+		return cmd_stats(args)
+	if command == 'status':
+		return cmd_status(args)
+	if command == 'reply':
+		return cmd_reply(args)
 	if command == 'clear':
-		return cmd_clear()
+		return cmd_clear(args)
 	if command == 'config':
 		return cmd_config()
 	if command == 'import-cookies':

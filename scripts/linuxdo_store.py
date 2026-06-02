@@ -1,0 +1,303 @@
+from __future__ import annotations
+
+import re
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterator
+
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+
+
+def utc_now() -> datetime:
+	return datetime.now(timezone.utc)
+
+
+def slugify_account_name(name: str) -> str:
+	slug = re.sub(r'[^a-zA-Z0-9_-]+', '-', name.strip().lower()).strip('-')
+	return slug or 'account'
+
+
+class Base(DeclarativeBase):
+	pass
+
+
+class Account(Base):
+	__tablename__ = 'accounts'
+
+	id: Mapped[int] = mapped_column(Integer, primary_key=True)
+	name: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+	slug: Mapped[str] = mapped_column(String(140), unique=True, nullable=False)
+	profile_dir: Mapped[str] = mapped_column(Text, nullable=False)
+	username: Mapped[str | None] = mapped_column(String(120), nullable=True)
+	target_level: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+	enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+	updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+	events: Mapped[list[ActivityEvent]] = relationship(back_populates='account', cascade='all, delete-orphan')
+	snapshots: Mapped[list[MetricSnapshot]] = relationship(back_populates='account', cascade='all, delete-orphan')
+	run_sessions: Mapped[list[RunSession]] = relationship(back_populates='account', cascade='all, delete-orphan')
+
+
+class ActivityEvent(Base):
+	__tablename__ = 'activity_events'
+
+	id: Mapped[int] = mapped_column(Integer, primary_key=True)
+	account_id: Mapped[int] = mapped_column(ForeignKey('accounts.id'), nullable=False, index=True)
+	event_type: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+	topic_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+	post_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+	value: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+
+	account: Mapped[Account] = relationship(back_populates='events')
+
+
+class MetricSnapshot(Base):
+	__tablename__ = 'metric_snapshots'
+
+	id: Mapped[int] = mapped_column(Integer, primary_key=True)
+	account_id: Mapped[int] = mapped_column(ForeignKey('accounts.id'), nullable=False, index=True)
+	level: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+	days_visited: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+	topics_entered: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+	posts_read: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+	read_minutes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+	likes_given: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+	likes_received: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+	replied_topics: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+	flags_received: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+	suspended_or_silenced: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+
+	account: Mapped[Account] = relationship(back_populates='snapshots')
+
+
+class RunSession(Base):
+	__tablename__ = 'run_sessions'
+
+	id: Mapped[int] = mapped_column(Integer, primary_key=True)
+	account_id: Mapped[int] = mapped_column(ForeignKey('accounts.id'), nullable=False, index=True)
+	started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+	ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+	status: Mapped[str] = mapped_column(String(30), default='running', nullable=False)
+	error: Mapped[str | None] = mapped_column(Text, nullable=True)
+	topics_viewed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+	posts_read: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+	likes_given: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+	account: Mapped[Account] = relationship(back_populates='run_sessions')
+
+
+class AccountStore:
+	def __init__(self, db_path: Path, profiles_dir: Path) -> None:
+		self.db_path = db_path
+		self.profiles_dir = profiles_dir
+		self.db_path.parent.mkdir(parents=True, exist_ok=True)
+		self.profiles_dir.mkdir(parents=True, exist_ok=True)
+		self.engine = create_engine(f'sqlite:///{self.db_path}', future=True)
+		self.Session = sessionmaker(self.engine, expire_on_commit=False, future=True)
+
+	def init_db(self) -> None:
+		Base.metadata.create_all(self.engine)
+
+	@contextmanager
+	def session(self) -> Iterator[Session]:
+		session = self.Session()
+		try:
+			yield session
+			session.commit()
+		except Exception:
+			session.rollback()
+			raise
+		finally:
+			session.close()
+
+	def unique_slug(self, session: Session, name: str) -> str:
+		base = slugify_account_name(name)
+		slug = base
+		index = 2
+		while session.scalar(select(Account).where(Account.slug == slug)) is not None:
+			slug = f'{base}-{index}'
+			index += 1
+		return slug
+
+	def add_account(self, name: str, target_level: int = 2) -> Account:
+		with self.session() as session:
+			existing = session.scalar(select(Account).where(Account.name == name))
+			if existing is not None:
+				raise ValueError(f'账号已存在: {name}')
+			slug = self.unique_slug(session, name)
+			account = Account(
+				name=name,
+				slug=slug,
+				profile_dir=str(self.profiles_dir / slug),
+				target_level=target_level,
+			)
+			session.add(account)
+			session.flush()
+			return account
+
+	def get_account(self, name_or_slug: str | None = None) -> Account:
+		with self.session() as session:
+			if name_or_slug:
+				account = session.scalar(
+					select(Account).where((Account.name == name_or_slug) | (Account.slug == name_or_slug))
+				)
+			else:
+				account = session.scalar(select(Account).order_by(Account.id))
+			if account is None:
+				label = name_or_slug or '默认账号'
+				raise ValueError(f'账号不存在: {label}')
+			return account
+
+	def get_or_create_default_account(self) -> Account:
+		with self.session() as session:
+			account = session.scalar(select(Account).order_by(Account.id))
+			if account is not None:
+				return account
+			account = Account(name='default', slug='default', profile_dir=str(self.profiles_dir / 'default'), target_level=2)
+			session.add(account)
+			session.flush()
+			return account
+
+	def list_accounts(self) -> list[Account]:
+		with self.session() as session:
+			return list(session.scalars(select(Account).order_by(Account.id)).all())
+
+	def update_username(self, account_id: int, username: str | None) -> None:
+		if not username:
+			return
+		with self.session() as session:
+			account = session.get(Account, account_id)
+			if account is not None:
+				account.username = username
+				account.updated_at = utc_now()
+
+	def update_profile_dir(self, account_id: int, profile_dir: Path) -> None:
+		with self.session() as session:
+			account = session.get(Account, account_id)
+			if account is not None:
+				account.profile_dir = str(profile_dir)
+				account.updated_at = utc_now()
+
+	def record_event(
+		self,
+		account_id: int,
+		event_type: str,
+		topic_id: str | None = None,
+		post_id: str | None = None,
+		value: int = 1,
+	) -> None:
+		with self.session() as session:
+			session.add(
+				ActivityEvent(
+					account_id=account_id,
+					event_type=event_type,
+					topic_id=topic_id,
+					post_id=post_id,
+					value=value,
+				)
+			)
+
+	def record_snapshot(self, account_id: int, metrics: dict[str, Any]) -> MetricSnapshot:
+		allowed = {
+			'level',
+			'days_visited',
+			'topics_entered',
+			'posts_read',
+			'read_minutes',
+			'likes_given',
+			'likes_received',
+			'replied_topics',
+			'flags_received',
+			'suspended_or_silenced',
+		}
+		payload = {key: value for key, value in metrics.items() if key in allowed}
+		with self.session() as session:
+			snapshot = MetricSnapshot(account_id=account_id, **payload)
+			session.add(snapshot)
+			session.flush()
+			return snapshot
+
+	def latest_snapshot(self, account_id: int) -> MetricSnapshot | None:
+		with self.session() as session:
+			return session.scalar(
+				select(MetricSnapshot)
+				.where(MetricSnapshot.account_id == account_id)
+				.order_by(MetricSnapshot.created_at.desc(), MetricSnapshot.id.desc())
+			)
+
+	def aggregate_metrics(self, account_id: int) -> dict[str, int | bool]:
+		with self.session() as session:
+			events = list(session.scalars(select(ActivityEvent).where(ActivityEvent.account_id == account_id)).all())
+			return {
+				'topics_entered': len({event.topic_id for event in events if event.event_type == 'topic_view' and event.topic_id}),
+				'posts_read': sum(1 for event in events if event.event_type == 'post_read'),
+				'read_minutes': sum(event.value for event in events if event.event_type == 'read_minute'),
+				'likes_given': sum(1 for event in events if event.event_type == 'like_given'),
+				'likes_received': 0,
+				'replied_topics': len(
+					{event.topic_id for event in events if event.event_type == 'manual_reply' and event.topic_id}
+				),
+				'days_visited': len({event.created_at.date() for event in events}),
+				'flags_received': 0,
+				'suspended_or_silenced': False,
+			}
+
+	def viewed_topics(self, account_id: int) -> set[str]:
+		with self.session() as session:
+			events = session.scalars(
+				select(ActivityEvent).where(
+					ActivityEvent.account_id == account_id,
+					ActivityEvent.event_type == 'topic_view',
+					ActivityEvent.topic_id.is_not(None),
+				)
+			)
+			return {event.topic_id for event in events if event.topic_id}
+
+	def liked_posts(self, account_id: int) -> set[str]:
+		with self.session() as session:
+			events = session.scalars(
+				select(ActivityEvent).where(
+					ActivityEvent.account_id == account_id,
+					ActivityEvent.event_type == 'like_given',
+					ActivityEvent.post_id.is_not(None),
+				)
+			)
+			return {event.post_id for event in events if event.post_id}
+
+	def start_run(self, account_id: int) -> int:
+		with self.session() as session:
+			run = RunSession(account_id=account_id)
+			session.add(run)
+			session.flush()
+			return run.id
+
+	def finish_run(
+		self,
+		run_id: int,
+		status: str,
+		error: str | None = None,
+		topics_viewed: int = 0,
+		posts_read: int = 0,
+		likes_given: int = 0,
+	) -> None:
+		with self.session() as session:
+			run = session.get(RunSession, run_id)
+			if run is None:
+				return
+			run.ended_at = utc_now()
+			run.status = status
+			run.error = error
+			run.topics_viewed = topics_viewed
+			run.posts_read = posts_read
+			run.likes_given = likes_given
+
+	def clear_account_events(self, account_id: int) -> None:
+		with self.session() as session:
+			for model in (ActivityEvent, MetricSnapshot, RunSession):
+				for row in session.scalars(select(model).where(model.account_id == account_id)):
+					session.delete(row)
