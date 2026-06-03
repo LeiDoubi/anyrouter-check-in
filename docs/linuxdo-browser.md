@@ -7,7 +7,7 @@
 ## 功能
 
 - 多账号 profile：每个账号独立保存登录态
-- 浏览流程：打开列表、进入未浏览话题、滚动阅读回复
+- 浏览流程：打开列表、进入未浏览话题、滚动阅读帖子/楼层
 - 本地统计：记录话题、帖子、阅读分钟、运行 session
 - 保守限额：支持单次和本地每日话题/点赞上限
 - 话题级点赞：进入话题时决定是否点赞，优先点赞已浏览内容里正文较长的帖子
@@ -23,6 +23,28 @@ uv run linuxdo-browser --help
 ```
 
 推荐本机安装 Google Chrome。脚本默认优先启动系统 Chrome，失败时回退到 Playwright Chromium。
+
+## 交互式 TUI
+
+不带子命令时会打开交互式菜单：
+
+```bash
+uv run linuxdo-browser
+```
+
+也可以显式打开：
+
+```bash
+uv run linuxdo-browser tui
+```
+
+TUI 主菜单包含：
+
+- 账号管理：账号列表、新增账号并登录、刷新登录、导入 Cookie
+- 浏览执行：按当前配置运行、自定义本次运行、运行所有启用账号
+- 状态与统计：同步 Connect 状态、查看本地缓存、浏览统计、记录手动回复
+- 配置：查看或编辑默认速度、列表、话题上限、点赞节奏
+- 数据管理：清理账号记录、重置本地数据
 
 ## 怎么运行
 
@@ -96,6 +118,7 @@ uv run linuxdo-browser status --account main
 
 | 命令 | 说明 |
 |------|------|
+| `linuxdo-browser` / `linuxdo-browser tui` | 打开交互式 TUI |
 | `linuxdo-browser accounts add/list` | 管理测试账号 |
 | `linuxdo-browser login` | 打开浏览器手动登录 |
 | `linuxdo-browser run` | 运行一次浏览测试 |

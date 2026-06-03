@@ -7,6 +7,7 @@ from scripts.linuxdo.linuxdo_browser import (
 	LinuxDoBrowser,
 	build_parser,
 	sync_status_for_account,
+	tui_args,
 )
 
 
@@ -60,6 +61,8 @@ def test_parser_accepts_status_sync_and_reset_commands():
 	status_args = parser.parse_args(['status', '--account', 'main', '--offline'])
 	sync_args = parser.parse_args(['sync-status', '--account', 'main', '--headless'])
 	reset_args = parser.parse_args(['reset', '--yes'])
+	tui_command_args = parser.parse_args(['tui'])
+	default_args = parser.parse_args([])
 
 	assert status_args.command == 'status'
 	assert status_args.offline is True
@@ -67,6 +70,18 @@ def test_parser_accepts_status_sync_and_reset_commands():
 	assert sync_args.headless is True
 	assert reset_args.command == 'reset'
 	assert reset_args.yes is True
+	assert tui_command_args.command == 'tui'
+	assert default_args.command is None
+
+
+def test_tui_args_provides_cli_defaults():
+	args = tui_args('run', account='main')
+
+	assert args.command == 'run'
+	assert args.account == 'main'
+	assert args.headless is False
+	assert args.max_topics is None
+	assert args.enable_like is None
 
 
 def test_browser_config_validates_target_level():

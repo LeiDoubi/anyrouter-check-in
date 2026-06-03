@@ -249,7 +249,10 @@ uv run playwright install chromium
 # 首次：浏览器登录
 uv run linuxdo-browser login
 
-# 开始浏览
+# 打开交互式 TUI
+uv run linuxdo-browser
+
+# 直接开始浏览
 uv run linuxdo-browser run
 
 # 可选：快速 + 未读列表 + 限制话题数 + 每话题最多 5 页

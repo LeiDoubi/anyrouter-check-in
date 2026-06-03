@@ -23,8 +23,11 @@ from typing import Any, cast
 from urllib.parse import urljoin
 
 from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from rich.console import Console
 from rich.panel import Panel
+from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
 from scripts.linuxdo.linuxdo_connect import ConnectStatus, parse_connect_status
@@ -253,6 +256,20 @@ def random_delay_ms(min_ms: int, max_ms: int) -> float:
 
 async def sleep_range(range_ms: tuple[int, int]) -> None:
 	await asyncio.sleep(random_delay_ms(*range_ms))
+
+
+async def safe_locator_attribute(locator: Any, name: str, timeout_ms: int = 1000) -> str | None:
+	try:
+		return await locator.get_attribute(name, timeout=timeout_ms)
+	except (PlaywrightError, PlaywrightTimeoutError):
+		return None
+
+
+async def safe_locator_box(locator: Any, timeout_ms: int = 1000) -> dict[str, float] | None:
+	try:
+		return await locator.bounding_box(timeout=timeout_ms)
+	except (PlaywrightError, PlaywrightTimeoutError):
+		return None
 
 
 def scale_ms_range(range_ms: tuple[int, int], factor: float, minimum: int = 80) -> tuple[int, int]:
@@ -717,7 +734,7 @@ class LinuxDoBrowser:
 				'button.discourse-reactions-reaction-button'
 			)
 			if await like_btn.count() > 0:
-				class_name = await like_btn.first.get_attribute('class') or ''
+				class_name = await safe_locator_attribute(like_btn.first, 'class') or ''
 				if any(flag in class_name for flag in ('has-like', 'my-likes', 'liked')):
 					return False
 
@@ -777,12 +794,14 @@ class LinuxDoBrowser:
 				if not self.running:
 					break
 				post = posts.nth(index)
-				post_dom_id = await post.get_attribute('id') or f'post_{index}'
+				post_dom_id = await safe_locator_attribute(post, 'id')
+				if not post_dom_id:
+					continue
 				post_key = post_dom_id.replace('post_', '')
 				if post_key in viewed_posts:
 					continue
 
-				box = await post.bounding_box()
+				box = await safe_locator_box(post)
 				if not box:
 					continue
 				viewport = self.page.viewport_size or {'width': 1360, 'height': 900}
@@ -805,7 +824,7 @@ class LinuxDoBrowser:
 					await sleep_range(tuple(read_range))
 
 				if topic_should_like and post_key not in like_candidate_keys:
-					actual_post_id = await post.get_attribute('data-post-id')
+					actual_post_id = await safe_locator_attribute(post, 'data-post-id')
 					if actual_post_id:
 						text_length = await self.post_text_length(post)
 						like_candidates.append((text_length, post_key, actual_post_id, post))
@@ -817,7 +836,7 @@ class LinuxDoBrowser:
 				if current_height > last_scroll_height:
 					last_scroll_height = current_height
 					no_new_content_count = 0
-					self.log('检测到新回复加载')
+					self.log('检测到更多帖子加载')
 				else:
 					no_new_content_count += 1
 					self.log(f'无新内容 ({no_new_content_count}/{speed["no_new_content_retry"]})')
@@ -964,8 +983,8 @@ class LinuxDoBrowser:
 		table.add_column('项目')
 		table.add_column('本次', justify='right')
 		table.add_column('总计', justify='right')
-		table.add_row('帖子', str(self.state.session_viewed), str(len(self.state.viewed_topics)))
-		table.add_row('回复', str(self.state.session_replies), str(self.state.total_replies))
+		table.add_row('话题', str(self.state.session_viewed), str(len(self.state.viewed_topics)))
+		table.add_row('已读帖子', str(self.state.session_replies), str(self.state.total_replies))
 		table.add_row('点赞', str(self.state.session_liked), str(len(self.state.liked_posts)))
 		if self.store is not None and self.account is not None:
 			daily = self.daily_counts()
@@ -1037,6 +1056,8 @@ def build_parser() -> argparse.ArgumentParser:
 	import_parser.add_argument('--account', help='Account name or slug')
 	import_parser.add_argument('cookies', nargs='?', help='Cookie string: name1=val1; name2=val2')
 	import_parser.add_argument('--file', '-f', help='Read cookies from file')
+
+	subparsers.add_parser('tui', help='Open interactive terminal UI')
 
 	return parser
 
@@ -1173,7 +1194,7 @@ async def cmd_login(args: argparse.Namespace) -> int:
 				)
 			)
 			try:
-				await asyncio.to_thread(input)
+				await asyncio.to_thread(tui_pause, '按 Enter 保存 session')
 			finally:
 				browser.running = False
 				verify_task.cancel()
@@ -1332,7 +1353,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
 	table.add_column('数量', justify='right')
 	table.add_row('已浏览话题', str(metrics.get('topics_entered', 0)))
 	table.add_row('已点赞帖子', str(metrics.get('likes_given', 0)))
-	table.add_row('累计浏览回复', str(metrics.get('posts_read', 0)))
+	table.add_row('累计已读帖子', str(metrics.get('posts_read', 0)))
 	table.add_row('累计阅读分钟', str(metrics.get('read_minutes', 0)))
 	daily = store.daily_event_counts(account.id)
 	table.add_row('今日浏览话题', str(daily['topic_view']))
@@ -1356,8 +1377,7 @@ def cmd_clear(args: argparse.Namespace) -> int:
 
 def cmd_reset(args: argparse.Namespace) -> int:
 	if CONFIG_DIR.exists() and not args.yes:
-		answer = input(f'确认删除 {CONFIG_DIR} 下的 Linux.do 本地数据？输入 yes 继续: ')
-		if answer.strip().lower() != 'yes':
+		if not Confirm.ask(f'确认删除 {CONFIG_DIR} 下的 Linux.do 本地数据？', default=False):
 			console.print('[dim]已取消[/]')
 			return 1
 	if CONFIG_DIR.exists():
@@ -1519,8 +1539,329 @@ def cmd_status_for_account(store: AccountStore, account: Account) -> None:
 		)
 
 
+def tui_pause(message: str = '按 Enter 返回') -> None:
+	Prompt.ask(f'[dim]{message}[/]', default='', show_default=False)
+
+
+def tui_args(command: str, **overrides: Any) -> argparse.Namespace:
+	defaults: dict[str, Any] = {
+		'command': command,
+		'account': None,
+		'headless': False,
+		'speed': None,
+		'list_type': None,
+		'enable_like': None,
+		'like_chance': None,
+		'max_topics': None,
+		'max_topic_pages': None,
+		'daily_topic_limit': None,
+		'daily_like_limit': None,
+		'accounts_command': None,
+		'name': None,
+		'target_level': 2,
+		'offline': False,
+		'reply_command': None,
+		'topic_id': None,
+		'yes': False,
+		'cookies': None,
+		'file': None,
+	}
+	defaults.update(overrides)
+	return argparse.Namespace(**defaults)
+
+
+def tui_menu(title: str, options: list[tuple[str, str]], default: str = '0') -> str:
+	table = Table(title=title, header_style='bold cyan')
+	table.add_column('选择', justify='center', no_wrap=True)
+	table.add_column('操作')
+	for key, label in options:
+		table.add_row(key, label)
+	console.print(table)
+	return Prompt.ask('请选择', choices=[key for key, _ in options], default=default)
+
+
+def tui_prompt_int(label: str, default: int, minimum: int = 0, maximum: int | None = None) -> int:
+	while True:
+		value = IntPrompt.ask(label, default=default)
+		if value < minimum:
+			console.print(f'[yellow]请输入不小于 {minimum} 的数字[/]')
+			continue
+		if maximum is not None and value > maximum:
+			console.print(f'[yellow]请输入不大于 {maximum} 的数字[/]')
+			continue
+		return value
+
+
+def tui_select_account(store: AccountStore, title: str = '选择账号', allow_cancel: bool = True) -> str | None:
+	accounts = store.list_accounts()
+	if not accounts:
+		accounts = [store.get_or_create_default_account()]
+
+	table = Table(title=title, header_style='bold cyan')
+	table.add_column('选择', justify='center', no_wrap=True)
+	table.add_column('名称')
+	table.add_column('Slug')
+	table.add_column('用户名')
+	table.add_column('目标等级', justify='right')
+	for index, account in enumerate(accounts, start=1):
+		table.add_row(str(index), account.name, account.slug, account.username or '-', str(account.target_level))
+	if allow_cancel:
+		table.add_row('0', '返回', '-', '-', '-')
+	console.print(table)
+
+	choices = [str(index) for index in range(1, len(accounts) + 1)]
+	if allow_cancel:
+		choices.append('0')
+	choice = Prompt.ask('请选择账号', choices=choices, default='1')
+	if choice == '0':
+		return None
+	return accounts[int(choice) - 1].slug
+
+
+def tui_collect_run_args(account_slug: str | None, command: str = 'run') -> argparse.Namespace:
+	config = load_config()
+	speed = Prompt.ask('速度', choices=list(SPEED_PRESETS), default=config.speed)
+	list_type = Prompt.ask('列表', choices=list(LIST_OPTIONS), default=config.list_type)
+	max_topics = tui_prompt_int('本次最多话题', config.max_topics_per_session, 1)
+	max_topic_pages = tui_prompt_int('每个话题最多浏览页数', config.max_topic_pages, 1)
+	daily_topic_limit = tui_prompt_int('今日话题上限（0 表示不限）', config.daily_topic_limit, 0)
+	daily_like_limit = tui_prompt_int('今日点赞上限（0 表示不限）', config.daily_like_limit, 0)
+	enable_like = Confirm.ask('开启点赞', default=config.enable_like)
+	like_chance = config.like_chance
+	if enable_like:
+		like_chance = Prompt.ask('备用点赞节奏', choices=list(LIKE_CHANCE_PRESETS), default=config.like_chance)
+	headless = Confirm.ask('无头运行', default=config.headless)
+	return tui_args(
+		command,
+		account=account_slug,
+		speed=speed,
+		list_type=list_type,
+		max_topics=max_topics,
+		max_topic_pages=max_topic_pages,
+		daily_topic_limit=daily_topic_limit,
+		daily_like_limit=daily_like_limit,
+		enable_like=enable_like,
+		like_chance=like_chance,
+		headless=headless,
+	)
+
+
+def tui_edit_config() -> None:
+	config = load_config()
+	config.speed = Prompt.ask('默认速度', choices=list(SPEED_PRESETS), default=config.speed)
+	config.list_type = Prompt.ask('默认列表', choices=list(LIST_OPTIONS), default=config.list_type)
+	config.enable_like = Confirm.ask('默认开启点赞', default=config.enable_like)
+	config.like_chance = Prompt.ask('默认备用点赞节奏', choices=list(LIKE_CHANCE_PRESETS), default=config.like_chance)
+	config.max_topics_per_session = tui_prompt_int('默认本次最多话题', config.max_topics_per_session, 1)
+	config.max_likes_per_session = tui_prompt_int('默认本次最多点赞', config.max_likes_per_session, 0)
+	config.max_topic_pages = tui_prompt_int('默认每话题最多页数', config.max_topic_pages, 1)
+	config.daily_topic_limit = tui_prompt_int('默认今日话题上限（0 表示不限）', config.daily_topic_limit, 0)
+	config.daily_like_limit = tui_prompt_int('默认今日点赞上限（0 表示不限）', config.daily_like_limit, 0)
+	config.return_to_list_delay_ms = tui_prompt_int('返回列表延迟 ms', config.return_to_list_delay_ms, 0)
+	config.validate()
+	save_config(config)
+	console.print('[green]配置已保存[/]')
+
+
+async def tui_accounts_menu() -> None:
+	while True:
+		choice = tui_menu(
+			'账号管理',
+			[
+				('1', '账号列表'),
+				('2', '新增账号并登录'),
+				('3', '登录或刷新选中账号'),
+				('4', '导入 Cookie 到选中账号'),
+				('0', '返回主菜单'),
+			],
+		)
+		if choice == '0':
+			return
+		if choice == '1':
+			await cmd_accounts(tui_args('accounts', accounts_command='list'))
+			tui_pause()
+		elif choice == '2':
+			name = Prompt.ask('账号名称').strip()
+			if not name:
+				console.print('[yellow]账号名称不能为空[/]')
+				continue
+			target_level = tui_prompt_int('目标等级', 2, 1, 4)
+			await cmd_accounts(tui_args('accounts', accounts_command='add', name=name, target_level=target_level))
+			tui_pause()
+		elif choice == '3':
+			store = get_store()
+			account = tui_select_account(store)
+			if account is not None:
+				await cmd_login(tui_args('login', account=account))
+				tui_pause()
+		elif choice == '4':
+			store = get_store()
+			account = tui_select_account(store)
+			if account is not None:
+				cookie_str = Prompt.ask('粘贴 Cookie 字符串', password=True).strip()
+				if cookie_str:
+					await cmd_import_cookies(tui_args('import-cookies', account=account, cookies=cookie_str))
+				else:
+					console.print('[yellow]Cookie 不能为空[/]')
+				tui_pause()
+
+
+async def tui_browse_menu() -> None:
+	while True:
+		choice = tui_menu(
+			'浏览执行',
+			[
+				('1', '选择账号并按当前配置运行'),
+				('2', '选择账号并自定义本次运行'),
+				('3', '运行所有启用账号（当前配置）'),
+				('4', '运行所有启用账号（自定义本次运行）'),
+				('0', '返回主菜单'),
+			],
+		)
+		if choice == '0':
+			return
+		if choice in {'1', '2'}:
+			store = get_store()
+			account = tui_select_account(store)
+			if account is None:
+				continue
+			if choice == '1':
+				await cmd_run(tui_args('run', account=account))
+			else:
+				await cmd_run(tui_collect_run_args(account))
+			tui_pause()
+		elif choice == '3':
+			if Confirm.ask('按当前配置运行所有启用账号？', default=True):
+				await cmd_run_all(tui_args('run-all'))
+				tui_pause()
+		elif choice == '4':
+			await cmd_run_all(tui_collect_run_args(None, command='run-all'))
+			tui_pause()
+
+
+async def tui_status_menu() -> None:
+	while True:
+		choice = tui_menu(
+			'状态与统计',
+			[
+				('1', '同步并查看升级状态'),
+				('2', '查看本地缓存状态'),
+				('3', '查看浏览统计'),
+				('4', '记录手动回复话题'),
+				('0', '返回主菜单'),
+			],
+		)
+		if choice == '0':
+			return
+		store = get_store()
+		account = tui_select_account(store)
+		if account is None:
+			continue
+		if choice == '1':
+			await cmd_status(tui_args('status', account=account, offline=False))
+		elif choice == '2':
+			await cmd_status(tui_args('status', account=account, offline=True))
+		elif choice == '3':
+			cmd_stats(tui_args('stats', account=account))
+		elif choice == '4':
+			topic_id = Prompt.ask('Topic ID').strip()
+			if topic_id:
+				cmd_reply(tui_args('reply', account=account, reply_command='mark', topic_id=topic_id))
+			else:
+				console.print('[yellow]Topic ID 不能为空[/]')
+		tui_pause()
+
+
+def tui_config_menu() -> None:
+	while True:
+		choice = tui_menu(
+			'配置',
+			[
+				('1', '查看当前配置'),
+				('2', '编辑默认配置'),
+				('0', '返回主菜单'),
+			],
+		)
+		if choice == '0':
+			return
+		if choice == '1':
+			cmd_config()
+		elif choice == '2':
+			tui_edit_config()
+		tui_pause()
+
+
+def tui_data_menu() -> None:
+	while True:
+		choice = tui_menu(
+			'数据管理',
+			[
+				('1', '清理选中账号的浏览记录'),
+				('2', '重置全部 Linux.do 本地数据'),
+				('0', '返回主菜单'),
+			],
+		)
+		if choice == '0':
+			return
+		if choice == '1':
+			store = get_store()
+			account = tui_select_account(store)
+			if account is not None and Confirm.ask('确认清理该账号的浏览记录？', default=False):
+				cmd_clear(tui_args('clear', account=account))
+				tui_pause()
+		elif choice == '2':
+			if Confirm.ask('确认重置全部 Linux.do 本地数据？', default=False):
+				cmd_reset(tui_args('reset', yes=True))
+				tui_pause()
+
+
+async def cmd_tui(args: argparse.Namespace) -> int:
+	_ = args
+	console.print(
+		Panel(
+			'使用数字选择子菜单；现有 CLI 命令仍可直接调用。',
+			title='Linux.do TUI',
+			border_style='bright_blue',
+		)
+	)
+	while True:
+		try:
+			choice = tui_menu(
+				'主菜单',
+				[
+					('1', '账号管理'),
+					('2', '浏览执行'),
+					('3', '状态与统计'),
+					('4', '配置'),
+					('5', '数据管理'),
+					('0', '退出'),
+				],
+			)
+			if choice == '0':
+				console.print('[dim]已退出[/]')
+				return 0
+			if choice == '1':
+				await tui_accounts_menu()
+			elif choice == '2':
+				await tui_browse_menu()
+			elif choice == '3':
+				await tui_status_menu()
+			elif choice == '4':
+				tui_config_menu()
+			elif choice == '5':
+				tui_data_menu()
+		except (KeyboardInterrupt, EOFError):
+			console.print('\n[dim]已退出[/]')
+			return 0
+		except ValueError as exc:
+			error_console.print(f'[bold red]ERROR:[/] {exc}')
+			tui_pause()
+
+
 async def async_main(args: argparse.Namespace) -> int:
-	command = args.command or 'run'
+	command = args.command or 'tui'
+	if command == 'tui':
+		return await cmd_tui(args)
 	if command == 'accounts':
 		return await cmd_accounts(args)
 	if command == 'login':
@@ -1553,7 +1894,7 @@ def main() -> int:
 	parser = build_parser()
 	args = parser.parse_args()
 	if args.command is None and '--help' not in sys.argv and '-h' not in sys.argv:
-		args.command = 'run'
+		args.command = 'tui'
 	return asyncio.run(async_main(args))
 
 
