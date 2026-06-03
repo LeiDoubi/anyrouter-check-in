@@ -1,4 +1,4 @@
-from scripts.linuxdo_planner import TrustLevelPlanner
+from scripts.linuxdo.linuxdo_planner import TrustLevelPlanner
 
 
 def test_level_one_requirements_and_actions():

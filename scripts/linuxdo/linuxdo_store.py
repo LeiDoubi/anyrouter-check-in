@@ -39,6 +39,10 @@ class Account(Base):
 	events: Mapped[list[ActivityEvent]] = relationship(back_populates='account', cascade='all, delete-orphan')
 	snapshots: Mapped[list[MetricSnapshot]] = relationship(back_populates='account', cascade='all, delete-orphan')
 	run_sessions: Mapped[list[RunSession]] = relationship(back_populates='account', cascade='all, delete-orphan')
+	connect_snapshots: Mapped[list[ConnectSnapshot]] = relationship(
+		back_populates='account',
+		cascade='all, delete-orphan',
+	)
 
 
 class ActivityEvent(Base):
@@ -89,6 +93,22 @@ class RunSession(Base):
 	likes_given: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 	account: Mapped[Account] = relationship(back_populates='run_sessions')
+
+
+class ConnectSnapshot(Base):
+	__tablename__ = 'connect_snapshots'
+
+	id: Mapped[int] = mapped_column(Integer, primary_key=True)
+	account_id: Mapped[int] = mapped_column(ForeignKey('accounts.id'), nullable=False, index=True)
+	current_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
+	requirement_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
+	visible_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
+	locked_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+	requirements_json: Mapped[str] = mapped_column(Text, default='[]', nullable=False)
+	raw_text: Mapped[str] = mapped_column(Text, default='', nullable=False)
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+
+	account: Mapped[Account] = relationship(back_populates='connect_snapshots')
 
 
 class AccountStore:
@@ -190,6 +210,7 @@ class AccountStore:
 		topic_id: str | None = None,
 		post_id: str | None = None,
 		value: int = 1,
+		created_at: datetime | None = None,
 	) -> None:
 		with self.session() as session:
 			session.add(
@@ -199,6 +220,7 @@ class AccountStore:
 					topic_id=topic_id,
 					post_id=post_id,
 					value=value,
+					created_at=created_at or datetime.now().astimezone(),
 				)
 			)
 
@@ -258,6 +280,29 @@ class AccountStore:
 			)
 			return {event.topic_id for event in events if event.topic_id}
 
+	def record_connect_snapshot(self, account_id: int, payload: dict[str, Any]) -> ConnectSnapshot:
+		with self.session() as session:
+			snapshot = ConnectSnapshot(
+				account_id=account_id,
+				current_level=payload.get('current_level'),
+				requirement_level=payload.get('requirement_level'),
+				visible_level=payload.get('visible_level'),
+				locked_message=payload.get('locked_message'),
+				requirements_json=str(payload.get('requirements_json') or '[]'),
+				raw_text=str(payload.get('raw_text') or ''),
+			)
+			session.add(snapshot)
+			session.flush()
+			return snapshot
+
+	def latest_connect_snapshot(self, account_id: int) -> ConnectSnapshot | None:
+		with self.session() as session:
+			return session.scalar(
+				select(ConnectSnapshot)
+				.where(ConnectSnapshot.account_id == account_id)
+				.order_by(ConnectSnapshot.created_at.desc(), ConnectSnapshot.id.desc())
+			)
+
 	def liked_posts(self, account_id: int) -> set[str]:
 		with self.session() as session:
 			events = session.scalars(
@@ -265,9 +310,26 @@ class AccountStore:
 					ActivityEvent.account_id == account_id,
 					ActivityEvent.event_type == 'like_given',
 					ActivityEvent.post_id.is_not(None),
+					)
 				)
-			)
 			return {event.post_id for event in events if event.post_id}
+
+	def daily_event_counts(self, account_id: int, local_day=None) -> dict[str, int]:
+		target_day = local_day or datetime.now().astimezone().date()
+		with self.session() as session:
+			events = list(session.scalars(select(ActivityEvent).where(ActivityEvent.account_id == account_id)).all())
+		topic_ids: set[str] = set()
+		likes = 0
+		for event in events:
+			event_day = event.created_at
+			event_date = event_day.date() if event_day.tzinfo is None else event_day.astimezone().date()
+			if event_date != target_day:
+				continue
+			if event.event_type == 'topic_view' and event.topic_id:
+				topic_ids.add(event.topic_id)
+			elif event.event_type == 'like_given':
+				likes += 1
+		return {'topic_view': len(topic_ids), 'like_given': likes}
 
 	def start_run(self, account_id: int) -> int:
 		with self.session() as session:
@@ -298,6 +360,6 @@ class AccountStore:
 
 	def clear_account_events(self, account_id: int) -> None:
 		with self.session() as session:
-			for model in (ActivityEvent, MetricSnapshot, RunSession):
+			for model in (ActivityEvent, MetricSnapshot, RunSession, ConnectSnapshot):
 				for row in session.scalars(select(model).where(model.account_id == account_id)):
 					session.delete(row)

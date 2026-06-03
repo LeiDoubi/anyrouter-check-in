@@ -25,7 +25,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from accounts_utils import load_accounts_file, refresh_api_users, save_accounts_file
 
-DEFAULT_ACCOUNTS_FILE = Path('.accounts.json')
+DEFAULT_ACCOUNTS_FILE = Path('./accounts/anyrouter.json')
 DEFAULT_ENV_FILE = Path('.env')
 DEFAULT_ENVIRONMENT = 'production'
 SECRET_NAME = 'ANYROUTER_ACCOUNTS'

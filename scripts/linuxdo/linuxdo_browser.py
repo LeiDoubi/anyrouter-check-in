@@ -14,6 +14,7 @@ import json
 import platform
 import random
 import re
+import shutil
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -26,13 +27,15 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from scripts.linuxdo_planner import TrustLevelPlanner
-from scripts.linuxdo_store import Account, AccountStore
+from scripts.linuxdo.linuxdo_connect import ConnectStatus, parse_connect_status
+from scripts.linuxdo.linuxdo_planner import TrustLevelPlanner
+from scripts.linuxdo.linuxdo_store import Account, AccountStore, ConnectSnapshot
 
 console = Console()
 error_console = Console(stderr=True)
 
 BASE_URL = 'https://linux.do'
+CONNECT_URL = 'https://connect.linux.do'
 CONFIG_DIR = Path.home() / '.config' / 'linuxdo-browser'
 LEGACY_PROFILE_DIR = CONFIG_DIR / 'profile'
 PROFILES_DIR = CONFIG_DIR / 'profiles'
@@ -86,6 +89,19 @@ LIKE_CHANCE_PRESETS = {
 	'veryHigh': 0.40,
 }
 
+LIKE_TOPIC_INTERVAL_FALLBACKS = {
+	'low': 4,
+	'medium': 3,
+	'high': 2,
+	'veryHigh': 1,
+}
+
+SPEED_VARIATION_PROFILES = (
+	{'name': '快', 'weight': 5, 'delay_factor': 0.55, 'scroll_factor': 1.35},
+	{'name': '正常', 'weight': 3, 'delay_factor': 0.80, 'scroll_factor': 1.10},
+	{'name': '慢', 'weight': 2, 'delay_factor': 1.15, 'scroll_factor': 0.90},
+)
+
 LAUNCH_ARGS = [
 	'--disable-blink-features=AutomationControlled',
 	*(
@@ -120,6 +136,7 @@ class BrowserConfig:
 	max_topics_per_session: int = 50
 	max_likes_per_session: int = 50
 	min_like_interval_ms: int = 2000
+	max_topic_pages: int = 5
 	return_to_list_delay_ms: int = 1000
 	headless: bool = False
 	stuck_timeout_sec: int = 30
@@ -140,6 +157,12 @@ class BrowserConfig:
 			raise ValueError(f'Unknown like chance preset: {self.like_chance}')
 		if self.target_level < 1 or self.target_level > 4:
 			raise ValueError(f'target_level must be between 1 and 4: {self.target_level}')
+		if self.daily_topic_limit < 0:
+			raise ValueError(f'daily_topic_limit must be >= 0: {self.daily_topic_limit}')
+		if self.daily_like_limit < 0:
+			raise ValueError(f'daily_like_limit must be >= 0: {self.daily_like_limit}')
+		if self.max_topic_pages < 1:
+			raise ValueError(f'max_topic_pages must be >= 1: {self.max_topic_pages}')
 
 	@property
 	def speed_config(self) -> dict[str, Any]:
@@ -230,6 +253,20 @@ def random_delay_ms(min_ms: int, max_ms: int) -> float:
 
 async def sleep_range(range_ms: tuple[int, int]) -> None:
 	await asyncio.sleep(random_delay_ms(*range_ms))
+
+
+def scale_ms_range(range_ms: tuple[int, int], factor: float, minimum: int = 80) -> tuple[int, int]:
+	return (max(minimum, int(range_ms[0] * factor)), max(minimum, int(range_ms[1] * factor)))
+
+
+def scale_speed_config(speed: dict[str, Any], delay_factor: float, scroll_factor: float) -> dict[str, Any]:
+	return {
+		**speed,
+		'scroll_step': max(160, int(speed['scroll_step'] * scroll_factor)),
+		'scroll_interval_ms': scale_ms_range(tuple(speed['scroll_interval_ms']), delay_factor, 120),
+		'load_wait_ms': scale_ms_range(tuple(speed['load_wait_ms']), delay_factor, 300),
+		'read_ms': scale_ms_range(tuple(speed['read_ms']), delay_factor, 80),
+	}
 
 
 def get_topic_id_from_url(url: str) -> str | None:
@@ -486,6 +523,15 @@ class LinuxDoBrowser:
 			}"""
 		)
 
+	async def sync_connect_status(self) -> ConnectStatus:
+		await self.page.goto(CONNECT_URL, wait_until='domcontentloaded')
+		await sleep_range((1500, 2500))
+		text = await self.page.locator('body').inner_text(timeout=15000)
+		status = parse_connect_status(text)
+		if self.store is not None and self.account is not None:
+			self.store.record_connect_snapshot(self.account.id, status.to_store_payload())
+		return status
+
 	async def get_csrf_token(self) -> str:
 		token = await self.page.locator('meta[name="csrf-token"]').get_attribute('content')
 		if not token:
@@ -562,10 +608,28 @@ class LinuxDoBrowser:
 			self.store.record_event(self.account.id, 'like_given', post_id=post_key)
 		self.state.save()
 		self.log(f'点赞帖子 #{post_key}')
+		if self.daily_like_limit_reached():
+			self.like_disabled = True
+			self.log('今日点赞上限已达，已关闭点赞')
 		self.heartbeat()
 
-	async def scroll_down(self) -> None:
-		step = self.config.speed_config['scroll_step'] + random.randint(-30, 30)
+	def sample_speed_config(self) -> tuple[str, dict[str, Any]]:
+		profile = random.choices(
+			SPEED_VARIATION_PROFILES,
+			weights=[float(item['weight']) for item in SPEED_VARIATION_PROFILES],
+			k=1,
+		)[0]
+		delay_factor = float(profile['delay_factor']) * random.uniform(0.9, 1.1)
+		scroll_factor = float(profile['scroll_factor']) * random.uniform(0.9, 1.1)
+		return str(profile['name']), scale_speed_config(self.config.speed_config, delay_factor, scroll_factor)
+
+	async def scroll_down(self, speed: dict[str, Any] | None = None, *, page_scroll: bool = False) -> None:
+		active_speed = speed or self.config.speed_config
+		step = int(active_speed['scroll_step']) + random.randint(-30, 30)
+		if page_scroll:
+			viewport = self.page.viewport_size or {'width': 1360, 'height': 900}
+			viewport_step = int(viewport['height'] * random.uniform(0.65, 0.95))
+			step = max(step, viewport_step)
 		await self.page.evaluate('step => window.scrollBy(0, step)', step)
 
 	async def scroll_to_top(self) -> None:
@@ -585,67 +649,125 @@ class LinuxDoBrowser:
 	async def get_scroll_height(self) -> int:
 		return int(await self.page.evaluate('document.documentElement.scrollHeight'))
 
-	def should_like(self) -> bool:
+	def topic_like_interval(self) -> int:
+		if self.config.daily_topic_limit > 0 and self.config.daily_like_limit > 0:
+			return max(1, round(self.config.daily_topic_limit / self.config.daily_like_limit))
+		if 0 < self.config.max_likes_per_session < self.config.max_topics_per_session:
+			return max(1, round(self.config.max_topics_per_session / self.config.max_likes_per_session))
+		return LIKE_TOPIC_INTERVAL_FALLBACKS[self.config.like_chance]
+
+	def should_like_topic(self) -> bool:
 		if self.like_disabled:
 			return False
 		if self.state.session_liked >= self.config.max_likes_per_session:
 			return False
+		if self.daily_like_limit_reached():
+			self.like_disabled = True
+			self.log('今日点赞上限已达，已关闭点赞')
+			return False
 		if time.monotonic() - self.last_like_time < self.config.min_like_interval_ms / 1000:
 			return False
-		return random.random() < self.config.like_chance_value
+		interval = self.topic_like_interval()
+		if self.store is not None and self.account is not None:
+			counts = self.daily_counts()
+			topics_viewed = counts['topic_view']
+			likes_given = counts['like_given']
+		else:
+			topics_viewed = self.state.session_viewed
+			likes_given = self.state.session_liked
+		return likes_given < topics_viewed // interval
 
-	async def try_like_post(self, post_locator, post_key: str, actual_post_id: str | None) -> None:
+	async def post_text_length(self, post_locator) -> int:
+		text = ''
+		body = post_locator.locator('.cooked').first
+		try:
+			if await body.count() > 0:
+				text = await body.inner_text(timeout=1000)
+			else:
+				text = await post_locator.inner_text(timeout=1000)
+		except Exception:
+			with contextlib.suppress(Exception):
+				text = await post_locator.inner_text(timeout=1000)
+		return len(re.sub(r'\s+', '', text))
+
+	def daily_counts(self) -> dict[str, int]:
+		if self.store is None or self.account is None:
+			return {'topic_view': 0, 'like_given': 0}
+		return self.store.daily_event_counts(self.account.id)
+
+	def daily_topic_limit_reached(self) -> bool:
+		if self.config.daily_topic_limit <= 0:
+			return False
+		return self.daily_counts()['topic_view'] >= self.config.daily_topic_limit
+
+	def daily_like_limit_reached(self) -> bool:
+		if self.config.daily_like_limit <= 0:
+			return False
+		return self.daily_counts()['like_given'] >= self.config.daily_like_limit
+
+	async def try_like_post(self, post_locator, post_key: str, actual_post_id: str | None) -> bool:
 		if not actual_post_id or post_key in self.state.liked_posts:
-			return
+			return False
 
-		like_btn = post_locator.locator(
-			'button[title="点赞此帖子"], '
-			'button.btn-toggle-reaction-like, '
-			'button.discourse-reactions-reaction-button'
-		)
-		if await like_btn.count() == 0:
-			return
-
-		class_name = await like_btn.first.get_attribute('class') or ''
-		if any(flag in class_name for flag in ('has-like', 'my-likes', 'liked')):
-			return
+		like_btn = None
+		if post_locator is not None:
+			like_btn = post_locator.locator(
+				'button[title="点赞此帖子"], '
+				'button.btn-toggle-reaction-like, '
+				'button.discourse-reactions-reaction-button'
+			)
+			if await like_btn.count() > 0:
+				class_name = await like_btn.first.get_attribute('class') or ''
+				if any(flag in class_name for flag in ('has-like', 'my-likes', 'liked')):
+					return False
 
 		await sleep_range((200, 500))
 		result = await self.send_like(actual_post_id)
-		if not result.get('success') and not result.get('rate_limited'):
+		if not result.get('success') and not result.get('rate_limited') and like_btn is not None and await like_btn.count() > 0:
 			self.log(f'API 点赞失败 ({result.get("error")})，尝试点击按钮')
 			result = await self.click_like_button(like_btn)
 
 		if result.get('success'):
 			self._record_like_success(post_key)
-			return
+			return True
 
 		if result.get('rate_limited'):
 			self.like_disabled = True
 			self.log(f'达到点赞上限，已关闭点赞: {result.get("error")}')
-			return
+			return False
 
 		self.log(f'点赞失败: {result.get("error")}')
+		return False
 
 	async def browse_topic(self, topic_id: str) -> None:
-		speed = self.config.speed_config
+		speed_label, speed = self.sample_speed_config()
 		topic_url = f'{BASE_URL}/t/topic/{topic_id}/1'
-		self.log(f'浏览话题 {topic_id}')
+		self.log(f'浏览话题 {topic_id}（节奏: {speed_label}）')
 		topic_started = time.monotonic()
 		await self.page.goto(topic_url, wait_until='domcontentloaded')
 		await sleep_range((1500, 2500))
+		topic_should_like = False
 
 		if topic_id not in self.state.viewed_topics:
+			if self.daily_topic_limit_reached():
+				self.log('今日话题浏览上限已达，跳过新话题记录')
+				return
 			self.state.viewed_topics.add(topic_id)
 			self.state.session_viewed += 1
 			if self.store is not None and self.account is not None:
 				self.store.record_event(self.account.id, 'topic_view', topic_id=topic_id)
 			self.state.save()
+			topic_should_like = self.should_like_topic()
+			if topic_should_like:
+				self.log(f'本话题计划点赞（约每 {self.topic_like_interval()} 个话题 1 次）')
 
 		await self.scroll_to_top()
 		last_scroll_height = await self.get_scroll_height()
 		no_new_content_count = 0
 		viewed_posts: set[str] = set()
+		like_candidate_keys: set[str] = set()
+		like_candidates: list[tuple[int, str, str, Any]] = []
+		topic_pages_viewed = 1
 
 		while self.running:
 			self.check_stuck()
@@ -682,9 +804,12 @@ class LinuxDoBrowser:
 				if read_range[1] > 0:
 					await sleep_range(tuple(read_range))
 
-				if self.should_like():
+				if topic_should_like and post_key not in like_candidate_keys:
 					actual_post_id = await post.get_attribute('data-post-id')
-					await self.try_like_post(post, post_key, actual_post_id)
+					if actual_post_id:
+						text_length = await self.post_text_length(post)
+						like_candidates.append((text_length, post_key, actual_post_id, post))
+						like_candidate_keys.add(post_key)
 
 			if await self.is_at_bottom():
 				await sleep_range(tuple(speed['load_wait_ms']))
@@ -702,8 +827,23 @@ class LinuxDoBrowser:
 			else:
 				no_new_content_count = 0
 
-			await self.scroll_down()
+			if topic_pages_viewed >= self.config.max_topic_pages:
+				self.log(f'已浏览 {topic_pages_viewed} 页，结束本话题')
+				break
+
+			await self.scroll_down(speed, page_scroll=True)
+			topic_pages_viewed += 1
 			await sleep_range(tuple(speed['scroll_interval_ms']))
+
+		if topic_should_like:
+			liked = False
+			for text_length, post_key, actual_post_id, post in sorted(like_candidates, reverse=True)[:5]:
+				self.log(f'准备点赞候选帖子 #{post_key}（正文约 {text_length} 字）')
+				liked = await self.try_like_post(post, post_key, actual_post_id)
+				if liked or self.like_disabled:
+					break
+			if not liked and not self.like_disabled:
+				self.log('本话题未找到可点赞的候选帖子')
 
 		read_minutes = int((time.monotonic() - topic_started) // 60)
 		if read_minutes > 0 and self.store is not None and self.account is not None:
@@ -712,6 +852,9 @@ class LinuxDoBrowser:
 		await sleep_range((self.config.return_to_list_delay_ms, int(self.config.return_to_list_delay_ms * 1.5)))
 
 	async def find_unviewed_topic(self) -> str | None:
+		if self.daily_topic_limit_reached():
+			self.log('今日话题浏览上限已达')
+			return None
 		rows = self.page.locator('.topic-list-item, tr[data-topic-id], .topic-list tr')
 		count = await rows.count()
 		for index in range(count):
@@ -762,7 +905,7 @@ class LinuxDoBrowser:
 						last_scroll_height = await self.get_scroll_height()
 						no_new_content_count = 0
 						continue
-			await self.scroll_down()
+			await self.scroll_down(speed)
 			await sleep_range(tuple(speed['scroll_interval_ms']))
 
 		return None
@@ -786,6 +929,9 @@ class LinuxDoBrowser:
 			while self.running:
 				if self.state.session_viewed >= self.config.max_topics_per_session:
 					self.log('已达到本次会话最大浏览话题数')
+					break
+				if self.daily_topic_limit_reached():
+					self.log('已达到今日话题浏览上限')
 					break
 
 				await self.handle_human_verification()
@@ -821,6 +967,10 @@ class LinuxDoBrowser:
 		table.add_row('帖子', str(self.state.session_viewed), str(len(self.state.viewed_topics)))
 		table.add_row('回复', str(self.state.session_replies), str(self.state.total_replies))
 		table.add_row('点赞', str(self.state.session_liked), str(len(self.state.liked_posts)))
+		if self.store is not None and self.account is not None:
+			daily = self.daily_counts()
+			table.add_row('今日话题', str(daily['topic_view']), str(self.config.daily_topic_limit or '不限'))
+			table.add_row('今日点赞', str(daily['like_given']), str(self.config.daily_like_limit or '不限'))
 		console.print(table)
 
 
@@ -843,23 +993,34 @@ def build_parser() -> argparse.ArgumentParser:
 	run_parser.add_argument('--account', help='Account name or slug')
 	run_parser.add_argument('--speed', choices=list(SPEED_PRESETS), help='Speed preset')
 	run_parser.add_argument('--list', choices=list(LIST_OPTIONS), dest='list_type', help='Topic list type')
-	run_parser.add_argument('--like', dest='enable_like', action=argparse.BooleanOptionalAction, help='Enable random likes')
-	run_parser.add_argument('--like-chance', choices=list(LIKE_CHANCE_PRESETS), help='Like probability preset')
+	run_parser.add_argument('--like', dest='enable_like', action=argparse.BooleanOptionalAction, help='Enable topic-paced likes')
+	run_parser.add_argument('--like-chance', choices=list(LIKE_CHANCE_PRESETS), help='Fallback like pacing preset')
 	run_parser.add_argument('--max-topics', type=int, help='Max topics per session')
+	run_parser.add_argument('--max-topic-pages', type=int, help='Max viewport pages to browse per topic')
+	run_parser.add_argument('--daily-topic-limit', type=int, help='Max newly viewed topics per local day (0 disables)')
+	run_parser.add_argument('--daily-like-limit', type=int, help='Max likes per local day (0 disables)')
 	run_parser.add_argument('--headless', action='store_true', help='Run browser headless')
 
 	run_all_parser = subparsers.add_parser('run-all', help='Run all enabled accounts')
 	run_all_parser.add_argument('--speed', choices=list(SPEED_PRESETS), help='Speed preset')
 	run_all_parser.add_argument('--list', choices=list(LIST_OPTIONS), dest='list_type', help='Topic list type')
-	run_all_parser.add_argument('--like', dest='enable_like', action=argparse.BooleanOptionalAction, help='Enable random likes')
-	run_all_parser.add_argument('--like-chance', choices=list(LIKE_CHANCE_PRESETS), help='Like probability preset')
+	run_all_parser.add_argument('--like', dest='enable_like', action=argparse.BooleanOptionalAction, help='Enable topic-paced likes')
+	run_all_parser.add_argument('--like-chance', choices=list(LIKE_CHANCE_PRESETS), help='Fallback like pacing preset')
 	run_all_parser.add_argument('--max-topics', type=int, help='Max topics per account')
+	run_all_parser.add_argument('--max-topic-pages', type=int, help='Max viewport pages to browse per topic')
+	run_all_parser.add_argument('--daily-topic-limit', type=int, help='Max newly viewed topics per local day (0 disables)')
+	run_all_parser.add_argument('--daily-like-limit', type=int, help='Max likes per local day (0 disables)')
 	run_all_parser.add_argument('--headless', action='store_true', help='Run browser headless')
 
 	stats_parser = subparsers.add_parser('stats', help='Show browsing stats')
 	stats_parser.add_argument('--account', help='Account name or slug')
 	status_parser = subparsers.add_parser('status', help='Show trust-level progress')
 	status_parser.add_argument('--account', help='Account name or slug')
+	status_parser.add_argument('--offline', action='store_true', help='Use cached status without opening browser')
+	status_parser.add_argument('--headless', action='store_true', help='Run browser headless during sync')
+	sync_parser = subparsers.add_parser('sync-status', help='Sync status from connect.linux.do')
+	sync_parser.add_argument('--account', help='Account name or slug')
+	sync_parser.add_argument('--headless', action='store_true', help='Run browser headless')
 	reply_parser = subparsers.add_parser('reply', help='Record manual replies')
 	reply_subparsers = reply_parser.add_subparsers(dest='reply_command')
 	reply_mark = reply_subparsers.add_parser('mark', help='Mark a topic as manually replied')
@@ -867,6 +1028,8 @@ def build_parser() -> argparse.ArgumentParser:
 	reply_mark.add_argument('--account', help='Account name or slug')
 	clear_parser = subparsers.add_parser('clear', help='Clear browsing history')
 	clear_parser.add_argument('--account', help='Account name or slug')
+	reset_parser = subparsers.add_parser('reset', help='Reset all linuxdo-browser local data')
+	reset_parser.add_argument('--yes', action='store_true', help='Skip confirmation prompt')
 
 	subparsers.add_parser('config', help='Show current config')
 
@@ -889,6 +1052,12 @@ def apply_cli_overrides(config: BrowserConfig, args: argparse.Namespace) -> None
 		config.like_chance = args.like_chance
 	if getattr(args, 'max_topics', None):
 		config.max_topics_per_session = args.max_topics
+	if getattr(args, 'max_topic_pages', None) is not None:
+		config.max_topic_pages = args.max_topic_pages
+	if getattr(args, 'daily_topic_limit', None) is not None:
+		config.daily_topic_limit = args.daily_topic_limit
+	if getattr(args, 'daily_like_limit', None) is not None:
+		config.daily_like_limit = args.daily_like_limit
 	if getattr(args, 'headless', False):
 		config.headless = True
 	config.validate()
@@ -945,13 +1114,37 @@ def latest_metrics(store: AccountStore, account: Account) -> dict[str, Any]:
 				'flags_received': snapshot.flags_received,
 				'suspended_or_silenced': snapshot.suspended_or_silenced,
 			}
-		)
+			)
+	connect_snapshot = store.latest_connect_snapshot(account.id)
+	if connect_snapshot is not None and connect_snapshot.current_level is not None:
+		metrics['level'] = connect_snapshot.current_level
 	metrics.setdefault('days_visited_100d', metrics.get('days_visited', 0))
 	metrics.setdefault('recent_topics_viewed', metrics.get('topics_entered', 0))
 	metrics.setdefault('recent_posts_read', metrics.get('posts_read', 0))
 	metrics.setdefault('manual_promotion', False)
 	metrics.setdefault('level', TrustLevelPlanner(metrics).current_level())
 	return metrics
+
+
+async def sync_status_for_account(config: BrowserConfig, store: AccountStore, account: Account) -> ConnectStatus:
+	browser = build_browser_for_account(config, store, account)
+	async with async_playwright() as playwright:
+		try:
+			await browser.launch(playwright)
+			return await browser.sync_connect_status()
+		finally:
+			await browser.close()
+
+
+async def try_sync_status_for_account(config: BrowserConfig, store: AccountStore, account: Account) -> bool:
+	try:
+		status = await sync_status_for_account(config, store, account)
+	except Exception as exc:
+		console.print(f'[yellow]Connect 状态同步失败，保留本地缓存:[/] {exc}')
+		return False
+	level = '-' if status.current_level is None else str(status.current_level)
+	console.print(f'[green]✓ Connect 状态已同步，当前等级: {level}[/]')
+	return True
 
 
 async def cmd_login(args: argparse.Namespace) -> int:
@@ -961,37 +1154,39 @@ async def cmd_login(args: argparse.Namespace) -> int:
 	save_config(config)
 	store = get_store()
 	account = resolve_account(store, getattr(args, 'account', None))
+	browser = build_browser_for_account(config, store, account)
 
 	async with async_playwright() as playwright:
-		browser = build_browser_for_account(config, store, account)
-		page = await browser.launch(playwright)
-		await page.goto(f'{BASE_URL}/latest', wait_until='domcontentloaded')
-		await browser.handle_human_verification()
-		browser.running = True
-		verify_task = asyncio.create_task(browser.watch_human_verification())
-		console.print(
-			Panel(
-				'请在打开的浏览器中登录 [bold]linux.do[/]\n'
-				'若出现 Human Verification，完成 hCaptcha 后脚本会自动点 Verify\n'
-				'登录完成后回到终端，按 Enter 保存 session',
-				title='Linux.do 登录',
-				border_style='bright_blue',
-			)
-		)
 		try:
-			await asyncio.to_thread(input)
+			page = await browser.launch(playwright)
+			await page.goto(f'{BASE_URL}/latest', wait_until='domcontentloaded')
+			await browser.handle_human_verification()
+			browser.running = True
+			verify_task = asyncio.create_task(browser.watch_human_verification())
+			console.print(
+				Panel(
+					'请在打开的浏览器中登录 [bold]linux.do[/]\n'
+					'若出现 Human Verification，完成 hCaptcha 后脚本会自动点 Verify\n'
+					'登录完成后回到终端，按 Enter 保存 session',
+					title='Linux.do 登录',
+					border_style='bright_blue',
+				)
+			)
+			try:
+				await asyncio.to_thread(input)
+			finally:
+				browser.running = False
+				verify_task.cancel()
+				with contextlib.suppress(asyncio.CancelledError):
+					await verify_task
+			await browser.handle_human_verification()
+			if await browser.is_logged_in():
+				store.update_username(account.id, await browser.get_current_username())
+				console.print('[green]✓ 登录状态已保存[/]')
+			else:
+				console.print('[yellow]未检测到登录元素，session 仍会保存，运行 run 时再验证[/]')
 		finally:
-			browser.running = False
-			verify_task.cancel()
-			with contextlib.suppress(asyncio.CancelledError):
-				await verify_task
-		await browser.handle_human_verification()
-		if await browser.is_logged_in():
-			store.update_username(account.id, await browser.get_current_username())
-			console.print('[green]✓ 登录状态已保存[/]')
-		else:
-			console.print('[yellow]未检测到登录元素，session 仍会保存，运行 run 时再验证[/]')
-		await browser.close()
+			await browser.close()
 	return 0
 
 
@@ -1026,18 +1221,20 @@ async def cmd_import_cookies(args: argparse.Namespace) -> int:
 	config = load_config()
 	store = get_store()
 	account = resolve_account(store, getattr(args, 'account', None))
+	browser = build_browser_for_account(config, store, account)
 	async with async_playwright() as playwright:
-		browser = build_browser_for_account(config, store, account)
-		await browser.launch(playwright)
-		await browser.context.add_cookies(cast(Any, cookies))
-		await browser.page.goto(f'{BASE_URL}/latest', wait_until='domcontentloaded')
-		await browser.handle_human_verification()
-		if await browser.is_logged_in():
-			store.update_username(account.id, await browser.get_current_username())
-			console.print(f'[green]✓ 已导入 {len(cookies)} 个 Cookie 并验证登录成功[/]')
-		else:
-			console.print(f'[yellow]已导入 {len(cookies)} 个 Cookie，但未检测到登录状态，Cookie 可能已过期[/]')
-		await browser.close()
+		try:
+			await browser.launch(playwright)
+			await browser.context.add_cookies(cast(Any, cookies))
+			await browser.page.goto(f'{BASE_URL}/latest', wait_until='domcontentloaded')
+			await browser.handle_human_verification()
+			if await browser.is_logged_in():
+				store.update_username(account.id, await browser.get_current_username())
+				console.print(f'[green]✓ 已导入 {len(cookies)} 个 Cookie 并验证登录成功[/]')
+			else:
+				console.print(f'[yellow]已导入 {len(cookies)} 个 Cookie，但未检测到登录状态，Cookie 可能已过期[/]')
+		finally:
+			await browser.close()
 	return 0
 
 
@@ -1055,7 +1252,8 @@ async def cmd_run(args: argparse.Namespace) -> int:
 			f'账号: [cyan]{account.name}[/]  '
 			f'速度: [cyan]{config.speed}[/]  列表: [cyan]{config.list_type}[/]  '
 			f'点赞: [cyan]{"开" if config.enable_like else "关"}[/]  '
-			f'概率: [cyan]{config.like_chance}[/]',
+			f'节奏: [cyan]{config.like_chance}[/]  '
+			f'每话题: [cyan]{config.max_topic_pages} 页[/]',
 			title='Linux.do 自动浏览',
 			border_style='bright_blue',
 		)
@@ -1063,9 +1261,11 @@ async def cmd_run(args: argparse.Namespace) -> int:
 
 	try:
 		async with async_playwright() as playwright:
-			await browser.launch(playwright)
-			await browser.run()
-			await browser.close()
+			try:
+				await browser.launch(playwright)
+				await browser.run()
+			finally:
+				await browser.close()
 	except KeyboardInterrupt:
 		browser.stop()
 		store.finish_run(
@@ -1095,6 +1295,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
 	finally:
 		store.record_snapshot(account.id, latest_metrics(store, account))
 
+	await try_sync_status_for_account(config, store, account)
 	browser.print_stats()
 	cmd_status_for_account(store, account)
 	return 0
@@ -1133,24 +1334,35 @@ def cmd_stats(args: argparse.Namespace) -> int:
 	table.add_row('已点赞帖子', str(metrics.get('likes_given', 0)))
 	table.add_row('累计浏览回复', str(metrics.get('posts_read', 0)))
 	table.add_row('累计阅读分钟', str(metrics.get('read_minutes', 0)))
+	daily = store.daily_event_counts(account.id)
+	table.add_row('今日浏览话题', str(daily['topic_view']))
+	table.add_row('今日点赞', str(daily['like_given']))
 	console.print(table)
 	config = load_config()
 	console.print(
-		f'当前配置: speed={config.speed}, list={config.list_type}, like={config.enable_like}, chance={config.like_chance}'
+		f'当前配置: speed={config.speed}, list={config.list_type}, like={config.enable_like}, '
+		f'like_pacing={config.like_chance}, max_topic_pages={config.max_topic_pages}'
 	)
 	return 0
 
 
 def cmd_clear(args: argparse.Namespace) -> int:
-	if getattr(args, 'account', None):
-		store = get_store()
-		account = resolve_account(store, args.account)
-		store.clear_account_events(account.id)
-		console.print(f'[green]已清除账号 {account.name} 的浏览记录[/]')
-	else:
-		state = BrowserState.load()
-		state.clear()
-		console.print('[green]已清除旧版默认浏览记录[/]')
+	store = get_store()
+	account = resolve_account(store, getattr(args, 'account', None))
+	store.clear_account_events(account.id)
+	console.print(f'[green]已清除账号 {account.name} 的浏览记录和状态快照[/]')
+	return 0
+
+
+def cmd_reset(args: argparse.Namespace) -> int:
+	if CONFIG_DIR.exists() and not args.yes:
+		answer = input(f'确认删除 {CONFIG_DIR} 下的 Linux.do 本地数据？输入 yes 继续: ')
+		if answer.strip().lower() != 'yes':
+			console.print('[dim]已取消[/]')
+			return 1
+	if CONFIG_DIR.exists():
+		shutil.rmtree(CONFIG_DIR)
+	console.print(f'[green]已重置 Linux.do 本地数据:[/] {CONFIG_DIR}')
 	return 0
 
 
@@ -1197,9 +1409,26 @@ async def cmd_accounts(args: argparse.Namespace) -> int:
 	return 1
 
 
-def cmd_status(args: argparse.Namespace) -> int:
+async def cmd_status(args: argparse.Namespace) -> int:
+	config = load_config()
+	if getattr(args, 'headless', False):
+		config.headless = True
 	store = get_store()
 	account = resolve_account(store, getattr(args, 'account', None))
+	if not getattr(args, 'offline', False):
+		await try_sync_status_for_account(config, store, account)
+	cmd_status_for_account(store, account)
+	return 0
+
+
+async def cmd_sync_status(args: argparse.Namespace) -> int:
+	config = load_config()
+	if getattr(args, 'headless', False):
+		config.headless = True
+	store = get_store()
+	account = resolve_account(store, getattr(args, 'account', None))
+	if not await try_sync_status_for_account(config, store, account):
+		return 1
 	cmd_status_for_account(store, account)
 	return 0
 
@@ -1220,10 +1449,50 @@ def cmd_reply(args: argparse.Namespace) -> int:
 	return 0
 
 
+def print_connect_snapshot(snapshot: ConnectSnapshot | None) -> None:
+	if snapshot is None:
+		console.print('[dim]Connect 状态: 暂无缓存，运行 status 或 sync-status 后更新[/]')
+		return
+	table = Table(title='Connect 状态', header_style='bold cyan')
+	table.add_column('项目')
+	table.add_column('值')
+	table.add_row('当前等级', '-' if snapshot.current_level is None else str(snapshot.current_level))
+	table.add_row('要求等级', '-' if snapshot.requirement_level is None else str(snapshot.requirement_level))
+	table.add_row('可见等级', '-' if snapshot.visible_level is None else str(snapshot.visible_level))
+	if snapshot.locked_message:
+		table.add_row('提示', snapshot.locked_message)
+	table.add_row('同步时间', snapshot.created_at.isoformat())
+	console.print(table)
+
+	try:
+		requirements = json.loads(snapshot.requirements_json)
+	except json.JSONDecodeError:
+		requirements = []
+	if requirements:
+		req_table = Table(title='Connect 要求', header_style='bold cyan')
+		req_table.add_column('要求')
+		req_table.add_column('当前', justify='right')
+		req_table.add_column('目标', justify='right')
+		req_table.add_column('状态')
+		for item in requirements:
+			done = item.get('done')
+			state = '-' if done is None else ('完成' if done else '待完成')
+			req_table.add_row(
+				str(item.get('label') or '-'),
+				'-' if item.get('current') is None else str(item.get('current')),
+				'-' if item.get('required') is None else str(item.get('required')),
+				state,
+			)
+		console.print(req_table)
+
+
 def cmd_status_for_account(store: AccountStore, account: Account) -> None:
 	metrics = latest_metrics(store, account)
 	planner = TrustLevelPlanner(metrics)
-	next_level = planner.next_level(account.target_level)
+	connect_snapshot = store.latest_connect_snapshot(account.id)
+	print_connect_snapshot(connect_snapshot)
+	current_level = connect_snapshot.current_level if connect_snapshot and connect_snapshot.current_level is not None else planner.current_level()
+	next_level = min(max(current_level + 1, 1), account.target_level, 4)
 	table = Table(title=f'升级进度 - {account.name}', header_style='bold cyan')
 	table.add_column('等级', justify='right')
 	table.add_column('要求')
@@ -1263,11 +1532,15 @@ async def async_main(args: argparse.Namespace) -> int:
 	if command == 'stats':
 		return cmd_stats(args)
 	if command == 'status':
-		return cmd_status(args)
+		return await cmd_status(args)
+	if command == 'sync-status':
+		return await cmd_sync_status(args)
 	if command == 'reply':
 		return cmd_reply(args)
 	if command == 'clear':
 		return cmd_clear(args)
+	if command == 'reset':
+		return cmd_reset(args)
 	if command == 'config':
 		return cmd_config()
 	if command == 'import-cookies':

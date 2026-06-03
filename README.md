@@ -238,7 +238,7 @@ uv run python scripts/push_accounts_secret.py --write
 
 ## Linux.do 自动浏览
 
-基于 Playwright 的 [linux.do](https://linux.do) 论坛自动浏览工具（Tampermonkey 用户脚本的 Python 版）。自动滚动列表、阅读未看话题、随机点赞，登录态保存在本地。
+基于 Playwright 的 [linux.do](https://linux.do) 论坛自动浏览工具（Tampermonkey 用户脚本的 Python 版）。自动滚动列表、阅读未看话题、按话题节奏点赞，登录态保存在本地。
 
 **完整文档见：[docs/linuxdo-browser.md](docs/linuxdo-browser.md)**
 
@@ -252,8 +252,8 @@ uv run linuxdo-browser login
 # 开始浏览
 uv run linuxdo-browser run
 
-# 可选：快速 + 未读列表 + 限制话题数
-uv run linuxdo-browser run --speed fast --list unread --max-topics 20
+# 可选：快速 + 未读列表 + 限制话题数 + 每话题最多 5 页
+uv run linuxdo-browser run --speed fast --list unread --max-topics 20 --max-topic-pages 5
 
 # 从 Chrome 复制 Cookie 导入（跳过登录）
 uv run linuxdo-browser import-cookies 'session=xxx; _forum_session=yyy'

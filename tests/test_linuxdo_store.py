@@ -1,8 +1,10 @@
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from scripts.linuxdo_store import AccountStore, slugify_account_name
+from scripts.linuxdo.linuxdo_connect import parse_connect_status
+from scripts.linuxdo.linuxdo_store import AccountStore, slugify_account_name
 
 
 def make_store(tmp_path: Path) -> AccountStore:
@@ -67,10 +69,31 @@ def test_snapshot_and_clear(tmp_path):
 
 	store.record_event(account.id, 'topic_view', topic_id='101')
 	store.record_snapshot(account.id, {'level': 1, 'likes_received': 2})
+	store.record_connect_snapshot(
+		account.id,
+		parse_connect_status('信任级别 3 的要求\n当前 1 级，达到 2 级可查看 3 级进度详情。').to_store_payload(),
+	)
 
 	assert store.latest_snapshot(account.id).level == 1
+	assert store.latest_connect_snapshot(account.id).current_level == 1
 
 	store.clear_account_events(account.id)
 
 	assert store.aggregate_metrics(account.id)['topics_entered'] == 0
 	assert store.latest_snapshot(account.id) is None
+	assert store.latest_connect_snapshot(account.id) is None
+
+
+def test_daily_event_counts_use_local_day(tmp_path):
+	store = make_store(tmp_path)
+	account = store.add_account('main')
+	now = datetime.now().astimezone()
+
+	store.record_event(account.id, 'topic_view', topic_id='101', created_at=now)
+	store.record_event(account.id, 'topic_view', topic_id='101', created_at=now)
+	store.record_event(account.id, 'topic_view', topic_id='102', created_at=now - timedelta(days=1))
+	store.record_event(account.id, 'like_given', post_id='1', created_at=now)
+
+	counts = store.daily_event_counts(account.id, now.date())
+
+	assert counts == {'topic_view': 1, 'like_given': 1}
