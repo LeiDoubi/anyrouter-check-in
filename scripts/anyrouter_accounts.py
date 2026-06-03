@@ -668,7 +668,7 @@ def read_codex_string_setting(key: str, default: str) -> str:
 
 def write_deploy_script(account: dict[str, Any], index: int, base_url: str, name: str) -> Path:
 	auth_token = get_auth_token(account)
-	codex_model = read_codex_string_setting('model', 'gpt-5-codex')
+	codex_model = read_codex_string_setting('model', 'gpt-5.5')
 	codex_provider = read_codex_string_setting('model_provider', 'anyrouter')
 	content = DEPLOY_SCRIPT_TEMPLATE.format(
 		account_name=shlex.quote(name),
