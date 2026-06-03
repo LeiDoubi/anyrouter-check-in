@@ -34,6 +34,8 @@ def test_parser_accepts_account_scoped_run_and_reply():
 			'5',
 			'--max-topic-pages',
 			'4',
+			'--min-read-minutes',
+			'10',
 			'--daily-topic-limit',
 			'3',
 			'--daily-like-limit',
@@ -47,6 +49,7 @@ def test_parser_accepts_account_scoped_run_and_reply():
 	assert run_args.account == 'main'
 	assert run_args.max_topics == 5
 	assert run_args.max_topic_pages == 4
+	assert run_args.min_read_minutes == 10
 	assert run_args.daily_topic_limit == 3
 	assert run_args.daily_like_limit == 2
 	assert run_args.enable_like is False
@@ -121,6 +124,41 @@ def test_browser_config_validates_max_topic_pages():
 		assert 'max_topic_pages' in str(exc)
 	else:
 		raise AssertionError('expected invalid max_topic_pages to fail')
+
+
+def test_browser_config_validates_min_read_minutes():
+	config = BrowserConfig(min_read_minutes_per_session=0)
+	config.validate()
+
+	config.min_read_minutes_per_session = -1
+	try:
+		config.validate()
+	except ValueError as exc:
+		assert 'min_read_minutes_per_session' in str(exc)
+	else:
+		raise AssertionError('expected invalid min_read_minutes_per_session to fail')
+
+
+def test_min_read_minutes_overrides_max_topics_limit():
+	browser = LinuxDoBrowser(
+		BrowserConfig(max_topics_per_session=1, min_read_minutes_per_session=2),
+		BrowserState(session_viewed=1, session_read_minutes=1),
+	)
+
+	assert browser.max_topics_limit_reached() is False
+
+	browser.state.session_read_minutes = 2
+	assert browser.max_topics_limit_reached() is True
+
+
+def test_read_minutes_accumulate_across_short_topics():
+	browser = LinuxDoBrowser(BrowserConfig(), BrowserState())
+
+	browser.record_read_time('101', 59)
+	assert browser.state.session_read_minutes == 0
+
+	browser.record_read_time('102', 1)
+	assert browser.state.session_read_minutes == 1
 
 
 def test_topic_like_interval_uses_daily_limit_ratio():

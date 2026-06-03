@@ -42,6 +42,7 @@ TUI 主菜单包含：
 
 - 账号管理：账号列表、新增账号并登录、刷新登录、导入 Cookie
 - 浏览执行：按当前配置运行、自定义本次运行、运行所有启用账号
+- 浏览执行的账号选择表会显示“今日执行”和“上次执行”
 - 状态与统计：同步 Connect 状态、查看本地缓存、浏览统计、记录手动回复
 - 配置：查看或编辑默认速度、列表、话题上限、点赞节奏
 - 数据管理：清理账号记录、重置本地数据
@@ -140,6 +141,7 @@ uv run linuxdo-browser run \
   --list latest \
   --max-topics 10 \
   --max-topic-pages 5 \
+  --min-read-minutes 10 \
   --daily-topic-limit 20 \
   --daily-like-limit 5
 ```
@@ -150,6 +152,7 @@ uv run linuxdo-browser run \
 | `--list` | `latest` | 列表来源：`latest` / `new` / `unread` |
 | `--max-topics` | `50` | 单次运行最多打开的新话题数 |
 | `--max-topic-pages` | `5` | 每个话题最多浏览的视口页数 |
+| `--min-read-minutes` | `0` | 本次至少累计阅读分钟数，`0` 表示不启用；启用后优先于 `--max-topics` |
 | `--daily-topic-limit` | `50` | 本机本地日期内最多记录的新话题数，`0` 表示不限制 |
 | `--daily-like-limit` | `30` | 本机本地日期内最多点赞数，`0` 表示不限制 |
 | `--like` / `--no-like` | 开启 | 是否执行点赞流程 |

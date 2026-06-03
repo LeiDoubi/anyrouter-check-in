@@ -255,8 +255,8 @@ uv run linuxdo-browser
 # 直接开始浏览
 uv run linuxdo-browser run
 
-# 可选：快速 + 未读列表 + 限制话题数 + 每话题最多 5 页
-uv run linuxdo-browser run --speed fast --list unread --max-topics 20 --max-topic-pages 5
+# 可选：快速 + 未读列表 + 限制话题数 + 每话题最多 5 页 + 至少阅读 10 分钟
+uv run linuxdo-browser run --speed fast --list unread --max-topics 20 --max-topic-pages 5 --min-read-minutes 10
 
 # 从 Chrome 复制 Cookie 导入（跳过登录）
 uv run linuxdo-browser import-cookies 'session=xxx; _forum_session=yyy'

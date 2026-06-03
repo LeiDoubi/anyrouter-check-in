@@ -18,6 +18,7 @@ import shutil
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urljoin
@@ -29,10 +30,12 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
+from rich.text import Text
+from sqlalchemy import select
 
 from scripts.linuxdo.linuxdo_connect import ConnectStatus, parse_connect_status
 from scripts.linuxdo.linuxdo_planner import TrustLevelPlanner
-from scripts.linuxdo.linuxdo_store import Account, AccountStore, ConnectSnapshot
+from scripts.linuxdo.linuxdo_store import Account, AccountStore, ConnectSnapshot, RunSession
 
 console = Console()
 error_console = Console(stderr=True)
@@ -140,6 +143,7 @@ class BrowserConfig:
 	max_likes_per_session: int = 50
 	min_like_interval_ms: int = 2000
 	max_topic_pages: int = 5
+	min_read_minutes_per_session: int = 0
 	return_to_list_delay_ms: int = 1000
 	headless: bool = False
 	stuck_timeout_sec: int = 30
@@ -166,6 +170,8 @@ class BrowserConfig:
 			raise ValueError(f'daily_like_limit must be >= 0: {self.daily_like_limit}')
 		if self.max_topic_pages < 1:
 			raise ValueError(f'max_topic_pages must be >= 1: {self.max_topic_pages}')
+		if self.min_read_minutes_per_session < 0:
+			raise ValueError(f'min_read_minutes_per_session must be >= 0: {self.min_read_minutes_per_session}')
 
 	@property
 	def speed_config(self) -> dict[str, Any]:
@@ -188,6 +194,7 @@ class BrowserState:
 	session_viewed: int = 0
 	session_liked: int = 0
 	session_replies: int = 0
+	session_read_minutes: int = 0
 	persist_file: bool = True
 
 	@classmethod
@@ -316,6 +323,8 @@ class LinuxDoBrowser:
 		self.last_activity = time.monotonic()
 		self.last_like_time = 0.0
 		self.like_disabled = not config.enable_like
+		self.read_seconds_carry = 0.0
+		self.max_topics_override_logged = False
 		self._context: BrowserContext | None = None
 		self._page: Page | None = None
 
@@ -722,6 +731,33 @@ class LinuxDoBrowser:
 			return False
 		return self.daily_counts()['like_given'] >= self.config.daily_like_limit
 
+	def read_minutes_target_reached(self) -> bool:
+		target = self.config.min_read_minutes_per_session
+		return target <= 0 or self.state.session_read_minutes >= target
+
+	def max_topics_limit_reached(self) -> bool:
+		if self.state.session_viewed < self.config.max_topics_per_session:
+			return False
+		if self.read_minutes_target_reached():
+			return True
+		if not self.max_topics_override_logged:
+			self.log(
+				f'已达到本次话题数上限，但阅读分钟未达标 '
+				f'({self.state.session_read_minutes}/{self.config.min_read_minutes_per_session})，继续浏览'
+			)
+			self.max_topics_override_logged = True
+		return False
+
+	def record_read_time(self, topic_id: str, elapsed_seconds: float) -> None:
+		self.read_seconds_carry += elapsed_seconds
+		read_minutes = int(self.read_seconds_carry // 60)
+		if read_minutes <= 0:
+			return
+		self.read_seconds_carry -= read_minutes * 60
+		self.state.session_read_minutes += read_minutes
+		if self.store is not None and self.account is not None:
+			self.store.record_event(self.account.id, 'read_minute', topic_id=topic_id, value=read_minutes)
+
 	async def try_like_post(self, post_locator, post_key: str, actual_post_id: str | None) -> bool:
 		if not actual_post_id or post_key in self.state.liked_posts:
 			return False
@@ -864,9 +900,7 @@ class LinuxDoBrowser:
 			if not liked and not self.like_disabled:
 				self.log('本话题未找到可点赞的候选帖子')
 
-		read_minutes = int((time.monotonic() - topic_started) // 60)
-		if read_minutes > 0 and self.store is not None and self.account is not None:
-			self.store.record_event(self.account.id, 'read_minute', topic_id=topic_id, value=read_minutes)
+		self.record_read_time(topic_id, time.monotonic() - topic_started)
 
 		await sleep_range((self.config.return_to_list_delay_ms, int(self.config.return_to_list_delay_ms * 1.5)))
 
@@ -887,7 +921,7 @@ class LinuxDoBrowser:
 			topic_id = get_topic_id_from_url(urljoin(BASE_URL, href))
 			if not topic_id or topic_id in self.state.viewed_topics:
 				continue
-			if self.state.session_viewed >= self.config.max_topics_per_session:
+			if self.max_topics_limit_reached():
 				return None
 			await link.scroll_into_view_if_needed()
 			await sleep_range((300, 600))
@@ -946,7 +980,7 @@ class LinuxDoBrowser:
 
 		try:
 			while self.running:
-				if self.state.session_viewed >= self.config.max_topics_per_session:
+				if self.max_topics_limit_reached():
 					self.log('已达到本次会话最大浏览话题数')
 					break
 				if self.daily_topic_limit_reached():
@@ -988,6 +1022,8 @@ class LinuxDoBrowser:
 		table.add_row('点赞', str(self.state.session_liked), str(len(self.state.liked_posts)))
 		if self.store is not None and self.account is not None:
 			daily = self.daily_counts()
+			metrics = self.store.aggregate_metrics(self.account.id)
+			table.add_row('阅读分钟', str(self.state.session_read_minutes), str(metrics.get('read_minutes', 0)))
 			table.add_row('今日话题', str(daily['topic_view']), str(self.config.daily_topic_limit or '不限'))
 			table.add_row('今日点赞', str(daily['like_given']), str(self.config.daily_like_limit or '不限'))
 		console.print(table)
@@ -1016,6 +1052,7 @@ def build_parser() -> argparse.ArgumentParser:
 	run_parser.add_argument('--like-chance', choices=list(LIKE_CHANCE_PRESETS), help='Fallback like pacing preset')
 	run_parser.add_argument('--max-topics', type=int, help='Max topics per session')
 	run_parser.add_argument('--max-topic-pages', type=int, help='Max viewport pages to browse per topic')
+	run_parser.add_argument('--min-read-minutes', type=int, help='Minimum read minutes for this session (0 disables)')
 	run_parser.add_argument('--daily-topic-limit', type=int, help='Max newly viewed topics per local day (0 disables)')
 	run_parser.add_argument('--daily-like-limit', type=int, help='Max likes per local day (0 disables)')
 	run_parser.add_argument('--headless', action='store_true', help='Run browser headless')
@@ -1027,6 +1064,7 @@ def build_parser() -> argparse.ArgumentParser:
 	run_all_parser.add_argument('--like-chance', choices=list(LIKE_CHANCE_PRESETS), help='Fallback like pacing preset')
 	run_all_parser.add_argument('--max-topics', type=int, help='Max topics per account')
 	run_all_parser.add_argument('--max-topic-pages', type=int, help='Max viewport pages to browse per topic')
+	run_all_parser.add_argument('--min-read-minutes', type=int, help='Minimum read minutes per account (0 disables)')
 	run_all_parser.add_argument('--daily-topic-limit', type=int, help='Max newly viewed topics per local day (0 disables)')
 	run_all_parser.add_argument('--daily-like-limit', type=int, help='Max likes per local day (0 disables)')
 	run_all_parser.add_argument('--headless', action='store_true', help='Run browser headless')
@@ -1075,6 +1113,8 @@ def apply_cli_overrides(config: BrowserConfig, args: argparse.Namespace) -> None
 		config.max_topics_per_session = args.max_topics
 	if getattr(args, 'max_topic_pages', None) is not None:
 		config.max_topic_pages = args.max_topic_pages
+	if getattr(args, 'min_read_minutes', None) is not None:
+		config.min_read_minutes_per_session = args.min_read_minutes
 	if getattr(args, 'daily_topic_limit', None) is not None:
 		config.daily_topic_limit = args.daily_topic_limit
 	if getattr(args, 'daily_like_limit', None) is not None:
@@ -1274,7 +1314,8 @@ async def cmd_run(args: argparse.Namespace) -> int:
 			f'速度: [cyan]{config.speed}[/]  列表: [cyan]{config.list_type}[/]  '
 			f'点赞: [cyan]{"开" if config.enable_like else "关"}[/]  '
 			f'节奏: [cyan]{config.like_chance}[/]  '
-			f'每话题: [cyan]{config.max_topic_pages} 页[/]',
+			f'每话题: [cyan]{config.max_topic_pages} 页[/]  '
+			f'目标分钟: [cyan]{config.min_read_minutes_per_session or "无"}[/]',
 			title='Linux.do 自动浏览',
 			border_style='bright_blue',
 		)
@@ -1362,7 +1403,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
 	config = load_config()
 	console.print(
 		f'当前配置: speed={config.speed}, list={config.list_type}, like={config.enable_like}, '
-		f'like_pacing={config.like_chance}, max_topic_pages={config.max_topic_pages}'
+		f'like_pacing={config.like_chance}, max_topic_pages={config.max_topic_pages}, '
+		f'min_read_minutes={config.min_read_minutes_per_session}'
 	)
 	return 0
 
@@ -1554,6 +1596,7 @@ def tui_args(command: str, **overrides: Any) -> argparse.Namespace:
 		'like_chance': None,
 		'max_topics': None,
 		'max_topic_pages': None,
+		'min_read_minutes': None,
 		'daily_topic_limit': None,
 		'daily_like_limit': None,
 		'accounts_command': None,
@@ -1592,10 +1635,48 @@ def tui_prompt_int(label: str, default: int, minimum: int = 0, maximum: int | No
 		return value
 
 
-def tui_select_account(store: AccountStore, title: str = '选择账号', allow_cancel: bool = True) -> str | None:
+def local_date_from_datetime(value) -> Any:
+	return value.date() if value.tzinfo is None else value.astimezone().date()
+
+
+def format_local_datetime(value) -> str:
+	local_value = value if value.tzinfo is None else value.astimezone()
+	return local_value.strftime('%Y-%m-%d %H:%M')
+
+
+def account_run_statuses(store: AccountStore, accounts: list[Account]) -> dict[int, tuple[bool, str]]:
+	account_ids = [account.id for account in accounts]
+	statuses = {account.id: (False, '-') for account in accounts}
+	if not account_ids:
+		return statuses
+	today = datetime.now().astimezone().date()
+	with store.session() as session:
+		runs = list(
+			session.scalars(
+				select(RunSession)
+				.where(RunSession.account_id.in_(account_ids))
+				.order_by(RunSession.started_at.desc(), RunSession.id.desc())
+			).all()
+		)
+	for run in runs:
+		has_run_today, last_run = statuses.get(run.account_id, (False, '-'))
+		if last_run == '-':
+			last_run = format_local_datetime(run.started_at)
+		has_run_today = has_run_today or local_date_from_datetime(run.started_at) == today
+		statuses[run.account_id] = (has_run_today, last_run)
+	return statuses
+
+
+def tui_select_account(
+	store: AccountStore,
+	title: str = '选择账号',
+	allow_cancel: bool = True,
+	show_run_status: bool = False,
+) -> str | None:
 	accounts = store.list_accounts()
 	if not accounts:
 		accounts = [store.get_or_create_default_account()]
+	run_statuses = account_run_statuses(store, accounts) if show_run_status else {}
 
 	table = Table(title=title, header_style='bold cyan')
 	table.add_column('选择', justify='center', no_wrap=True)
@@ -1603,10 +1684,26 @@ def tui_select_account(store: AccountStore, title: str = '选择账号', allow_c
 	table.add_column('Slug')
 	table.add_column('用户名')
 	table.add_column('目标等级', justify='right')
+	if show_run_status:
+		table.add_column('今日执行', justify='center')
+		table.add_column('上次执行', no_wrap=True)
 	for index, account in enumerate(accounts, start=1):
-		table.add_row(str(index), account.name, account.slug, account.username or '-', str(account.target_level))
+		row: list[str | Text] = [
+			str(index),
+			account.name,
+			account.slug,
+			account.username or '-',
+			str(account.target_level),
+		]
+		if show_run_status:
+			has_run_today, last_run = run_statuses[account.id]
+			row.extend([Text('🟢') if has_run_today else Text('', style='dim'), last_run])
+		table.add_row(*row)
 	if allow_cancel:
-		table.add_row('0', '返回', '-', '-', '-')
+		row = ['0', '返回', '-', '-', '-']
+		if show_run_status:
+			row.extend(['-', '-'])
+		table.add_row(*row)
 	console.print(table)
 
 	choices = [str(index) for index in range(1, len(accounts) + 1)]
@@ -1624,6 +1721,7 @@ def tui_collect_run_args(account_slug: str | None, command: str = 'run') -> argp
 	list_type = Prompt.ask('列表', choices=list(LIST_OPTIONS), default=config.list_type)
 	max_topics = tui_prompt_int('本次最多话题', config.max_topics_per_session, 1)
 	max_topic_pages = tui_prompt_int('每个话题最多浏览页数', config.max_topic_pages, 1)
+	min_read_minutes = tui_prompt_int('本次目标阅读分钟（0 表示不启用）', config.min_read_minutes_per_session, 0)
 	daily_topic_limit = tui_prompt_int('今日话题上限（0 表示不限）', config.daily_topic_limit, 0)
 	daily_like_limit = tui_prompt_int('今日点赞上限（0 表示不限）', config.daily_like_limit, 0)
 	enable_like = Confirm.ask('开启点赞', default=config.enable_like)
@@ -1638,6 +1736,7 @@ def tui_collect_run_args(account_slug: str | None, command: str = 'run') -> argp
 		list_type=list_type,
 		max_topics=max_topics,
 		max_topic_pages=max_topic_pages,
+		min_read_minutes=min_read_minutes,
 		daily_topic_limit=daily_topic_limit,
 		daily_like_limit=daily_like_limit,
 		enable_like=enable_like,
@@ -1655,6 +1754,11 @@ def tui_edit_config() -> None:
 	config.max_topics_per_session = tui_prompt_int('默认本次最多话题', config.max_topics_per_session, 1)
 	config.max_likes_per_session = tui_prompt_int('默认本次最多点赞', config.max_likes_per_session, 0)
 	config.max_topic_pages = tui_prompt_int('默认每话题最多页数', config.max_topic_pages, 1)
+	config.min_read_minutes_per_session = tui_prompt_int(
+		'默认本次目标阅读分钟（0 表示不启用）',
+		config.min_read_minutes_per_session,
+		0,
+	)
 	config.daily_topic_limit = tui_prompt_int('默认今日话题上限（0 表示不限）', config.daily_topic_limit, 0)
 	config.daily_like_limit = tui_prompt_int('默认今日点赞上限（0 表示不限）', config.daily_like_limit, 0)
 	config.return_to_list_delay_ms = tui_prompt_int('返回列表延迟 ms', config.return_to_list_delay_ms, 0)
@@ -1722,7 +1826,7 @@ async def tui_browse_menu() -> None:
 			return
 		if choice in {'1', '2'}:
 			store = get_store()
-			account = tui_select_account(store)
+			account = tui_select_account(store, show_run_status=True)
 			if account is None:
 				continue
 			if choice == '1':
