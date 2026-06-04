@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import platform
 import random
 import re
@@ -23,9 +24,13 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urljoin
 
-from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
+from dotenv import load_dotenv
+from openai import OpenAI
+from playwright.async_api import BrowserContext
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Page, Playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, IntPrompt, Prompt
@@ -132,6 +137,8 @@ VERIFY_BUTTON_SELECTORS = (
 	'button:has-text("验证")',
 )
 
+MAX_LIKE_CANDIDATES_PER_TOPIC = 2
+
 
 @dataclass
 class BrowserConfig:
@@ -154,6 +161,12 @@ class BrowserConfig:
 	daily_like_limit: int = 30
 	run_all_cooldown_min_sec: int = 30
 	run_all_cooldown_max_sec: int = 90
+	enable_llm_reply: bool = True
+	llm_base_url: str = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+	llm_model: str = 'qwen3.6-plus'
+	llm_api_key: str = ''
+	llm_topic_count: int = 3
+	llm_reply_max_chars: int = 220
 
 	def validate(self) -> None:
 		if self.speed not in SPEED_PRESETS:
@@ -172,6 +185,10 @@ class BrowserConfig:
 			raise ValueError(f'max_topic_pages must be >= 1: {self.max_topic_pages}')
 		if self.min_read_minutes_per_session < 0:
 			raise ValueError(f'min_read_minutes_per_session must be >= 0: {self.min_read_minutes_per_session}')
+		if self.llm_topic_count < 1:
+			raise ValueError(f'llm_topic_count must be >= 1: {self.llm_topic_count}')
+		if self.llm_reply_max_chars < 20:
+			raise ValueError(f'llm_reply_max_chars must be >= 20: {self.llm_reply_max_chars}')
 
 	@property
 	def speed_config(self) -> dict[str, Any]:
@@ -257,6 +274,116 @@ def save_config(config: BrowserConfig) -> None:
 	CONFIG_FILE.write_text(json.dumps(asdict(config), indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
 
 
+def normalize_openai_base_url(url: str) -> str:
+	base_url = url.strip().rstrip('/')
+	if base_url.endswith('/chat/completions'):
+		base_url = base_url[: -len('/chat/completions')]
+	if not base_url.endswith('/v1') and '/v1/' not in (base_url + '/'):
+		base_url = f'{base_url}/v1'
+	return base_url.rstrip('/')
+
+
+def effective_llm_settings(config: BrowserConfig) -> tuple[str, str, str]:
+	load_dotenv()
+	base_url = os.environ.get('OPENAI_BASE_URL', '').strip() or config.llm_base_url
+	model = os.environ.get('OPENAI_MODEL', '').strip() or config.llm_model
+	api_key = os.environ.get('OPENAI_API_KEY', '').strip() or config.llm_api_key
+	return normalize_openai_base_url(base_url), model.strip(), api_key.strip()
+
+
+def extract_json_payload(text: str) -> Any:
+	content = text.strip()
+	if content.startswith('```'):
+		content = re.sub(r'^```(?:json)?\s*', '', content)
+		content = re.sub(r'\s*```$', '', content)
+	try:
+		return json.loads(content)
+	except json.JSONDecodeError:
+		pass
+	for opener, closer in (('{', '}'), ('[', ']')):
+		start = content.find(opener)
+		end = content.rfind(closer)
+		if start >= 0 and end > start:
+			return json.loads(content[start : end + 1])
+	raise ValueError('LLM 未返回可解析的 JSON')
+
+
+def llm_chat_json(config: BrowserConfig, messages: list[dict[str, str]]) -> Any:
+	base_url, model, api_key = effective_llm_settings(config)
+	if not base_url or not model or not api_key:
+		raise RuntimeError('LLM 配置不完整，请在 TUI 配置 OPENAI_BASE_URL / OPENAI_MODEL / OPENAI_API_KEY')
+	client = OpenAI(base_url=base_url, api_key=api_key)
+	response = client.chat.completions.create(
+		model=model,
+		messages=messages,
+		temperature=0.35,
+	)
+	content = response.choices[0].message.content or ''
+	return extract_json_payload(content)
+
+
+def select_llm_topic_ids(config: BrowserConfig, topics: list[dict[str, str]], count: int) -> list[str]:
+	payload = llm_chat_json(
+		config,
+		[
+			{
+				'role': 'system',
+				'content': (
+					'你是 Linux.do 论坛浏览助手。只返回 JSON。'
+					'从候选话题标题中选择最适合认真回复的高价值话题，避免灌水、纯情绪、重复或太宽泛的话题。'
+				),
+			},
+			{
+				'role': 'user',
+				'content': json.dumps(
+					{
+						'count': count,
+						'topics': topics,
+						'output_schema': {'topic_ids': ['topic_id']},
+					},
+					ensure_ascii=False,
+				),
+			},
+		],
+	)
+	topic_ids = payload.get('topic_ids') if isinstance(payload, dict) else None
+	if not isinstance(topic_ids, list):
+		raise ValueError('LLM 话题筛选结果缺少 topic_ids')
+	valid_ids = {topic['topic_id'] for topic in topics}
+	return [str(topic_id) for topic_id in topic_ids if str(topic_id) in valid_ids][:count]
+
+
+def generate_llm_reply(config: BrowserConfig, topic: dict[str, str], posts: list[dict[str, str]]) -> str:
+	payload = llm_chat_json(
+		config,
+		[
+			{
+				'role': 'system',
+				'content': (
+					'你是谨慎的中文论坛回复助手。只返回 JSON。'
+					'生成一条自然、具体、低姿态的回复，不要编造个人经历，不要使用营销语气，不要重复题主原文。'
+				),
+			},
+			{
+				'role': 'user',
+				'content': json.dumps(
+					{
+						'topic': topic,
+						'other_user_posts': posts,
+						'max_chars': config.llm_reply_max_chars,
+						'output_schema': {'reply': 'candidate reply text'},
+					},
+					ensure_ascii=False,
+				),
+			},
+		],
+	)
+	reply = payload.get('reply') if isinstance(payload, dict) else None
+	if not isinstance(reply, str) or not reply.strip():
+		raise ValueError('LLM 回复结果缺少 reply')
+	return reply.strip()[: config.llm_reply_max_chars]
+
+
 def random_delay_ms(min_ms: int, max_ms: int) -> float:
 	return random.randint(min_ms, max_ms) / 1000
 
@@ -296,6 +423,15 @@ def scale_speed_config(speed: dict[str, Any], delay_factor: float, scroll_factor
 def get_topic_id_from_url(url: str) -> str | None:
 	match = TOPIC_ID_PATTERN.search(url)
 	return match.group(1) if match else None
+
+
+def topic_list_has_new_content(
+	known_topic_ids: set[str],
+	current_topic_ids: set[str],
+	last_scroll_height: int,
+	current_scroll_height: int,
+) -> bool:
+	return current_scroll_height > last_scroll_height or bool(current_topic_ids - known_topic_ids)
 
 
 def page_type_from_url(url: str) -> str:
@@ -613,6 +749,49 @@ class LinuxDoBrowser:
 		)
 		return result if isinstance(result, dict) else {'success': False, 'error': '未知错误'}
 
+	async def send_reply(self, topic_id: str, raw: str) -> dict[str, Any]:
+		result = await self.page.evaluate(
+			"""async ({ topicId, raw }) => {
+				const csrf = document.querySelector('meta[name="csrf-token"]')?.content;
+				if (!csrf) return { success: false, error: '无 CSRF Token' };
+
+				try {
+					const response = await fetch('/posts.json', {
+						method: 'POST',
+						credentials: 'same-origin',
+						headers: {
+							'Content-Type': 'application/json',
+							'X-CSRF-Token': csrf,
+							'X-Requested-With': 'XMLHttpRequest',
+							'Discourse-Present': 'true',
+						},
+						body: JSON.stringify({
+							topic_id: topicId,
+							raw,
+							archetype: 'regular',
+						}),
+					});
+
+					let data = {};
+					try {
+						data = await response.json();
+					} catch (e) {}
+
+					if (response.ok) {
+						return { success: true, post_id: data.id ? String(data.id) : null };
+					}
+
+					const errors = data.errors;
+					const error = Array.isArray(errors) ? errors[0] : `HTTP ${response.status}`;
+					return { success: false, error, status: response.status };
+				} catch (e) {
+					return { success: false, error: String(e) };
+				}
+			}""",
+			{'topicId': topic_id, 'raw': raw},
+		)
+		return result if isinstance(result, dict) else {'success': False, 'error': '未知错误'}
+
 	async def click_like_button(self, like_btn) -> dict[str, Any]:
 		try:
 			await like_btn.first.scroll_into_view_if_needed()
@@ -626,12 +805,12 @@ class LinuxDoBrowser:
 		except Exception as exc:
 			return {'success': False, 'error': str(exc)}
 
-	def _record_like_success(self, post_key: str) -> None:
+	def _record_like_success(self, post_key: str, topic_id: str | None = None) -> None:
 		self.state.liked_posts.add(post_key)
 		self.state.session_liked += 1
 		self.last_like_time = time.monotonic()
 		if self.store is not None and self.account is not None:
-			self.store.record_event(self.account.id, 'like_given', post_id=post_key)
+			self.store.record_event(self.account.id, 'like_given', topic_id=topic_id, post_id=post_key)
 		self.state.save()
 		self.log(f'点赞帖子 #{post_key}')
 		if self.daily_like_limit_reached():
@@ -656,7 +835,15 @@ class LinuxDoBrowser:
 			viewport = self.page.viewport_size or {'width': 1360, 'height': 900}
 			viewport_step = int(viewport['height'] * random.uniform(0.65, 0.95))
 			step = max(step, viewport_step)
-		await self.page.evaluate('step => window.scrollBy(0, step)', step)
+		viewport = self.page.viewport_size or {'width': 1360, 'height': 900}
+		try:
+			await self.page.mouse.move(
+				viewport['width'] * random.uniform(0.45, 0.55),
+				viewport['height'] * random.uniform(0.65, 0.75),
+			)
+			await self.page.mouse.wheel(0, step)
+		except PlaywrightError:
+			await self.page.evaluate('step => window.scrollBy(0, step)', step)
 
 	async def scroll_to_top(self) -> None:
 		await self.page.evaluate('window.scrollTo(0, 0)')
@@ -674,6 +861,31 @@ class LinuxDoBrowser:
 
 	async def get_scroll_height(self) -> int:
 		return int(await self.page.evaluate('document.documentElement.scrollHeight'))
+
+	async def loaded_list_topic_ids(self) -> set[str]:
+		raw_ids = await self.page.evaluate(
+			"""() => {
+				const ids = new Set();
+				for (const row of document.querySelectorAll('[data-topic-id]')) {
+					const id = row.getAttribute('data-topic-id');
+					if (id) ids.add(id);
+				}
+				for (const link of document.querySelectorAll('a[href*="/t/topic/"]')) {
+					const href = link.getAttribute('href') || '';
+					const match = href.match(/\\/t\\/topic\\/(\\d+)/);
+					if (match) ids.add(match[1]);
+				}
+				return Array.from(ids);
+			}"""
+		)
+		if not isinstance(raw_ids, list):
+			return set()
+		return {str(topic_id) for topic_id in raw_ids if topic_id}
+
+	async def nudge_list_loader_at_bottom(self, speed: dict[str, Any]) -> None:
+		for _ in range(3):
+			await self.scroll_down(speed, page_scroll=True)
+			await sleep_range((120, 260))
 
 	def topic_like_interval(self) -> int:
 		if self.config.daily_topic_limit > 0 and self.config.daily_like_limit > 0:
@@ -703,7 +915,22 @@ class LinuxDoBrowser:
 			likes_given = self.state.session_liked
 		return likes_given < topics_viewed // interval
 
-	async def post_text_length(self, post_locator) -> int:
+	async def current_topic_title(self) -> str:
+		title = await self.page.evaluate(
+			"""() => {
+				const title =
+					document.querySelector('h1 .fancy-title') ||
+					document.querySelector('h1 a.fancy-title') ||
+					document.querySelector('h1') ||
+					document.querySelector('title');
+				return (title?.textContent || '').trim();
+			}"""
+		)
+		if isinstance(title, str) and title.strip():
+			return re.sub(r'\s+', ' ', title).strip()
+		return f'Topic {self.page.url}'
+
+	async def post_text(self, post_locator) -> str:
 		text = ''
 		body = post_locator.locator('.cooked').first
 		try:
@@ -714,7 +941,45 @@ class LinuxDoBrowser:
 		except Exception:
 			with contextlib.suppress(Exception):
 				text = await post_locator.inner_text(timeout=1000)
+		return re.sub(r'\s+', ' ', text).strip()
+
+	async def post_text_length(self, post_locator) -> int:
+		text = await self.post_text(post_locator)
 		return len(re.sub(r'\s+', '', text))
+
+	async def post_author(self, post_locator) -> str | None:
+		for selector in ('.topic-meta-data .names a', '.names a', '[data-user-card]'):
+			locator = post_locator.locator(selector).first
+			try:
+				if await locator.count() == 0:
+					continue
+				value = await locator.inner_text(timeout=1000)
+				if value.strip():
+					return value.strip()
+			except Exception:
+				continue
+		return None
+
+	def record_post_snapshot(
+		self,
+		topic_id: str,
+		topic_title: str,
+		post_key: str,
+		text: str,
+		author: str | None,
+	) -> None:
+		if self.store is None or self.account is None:
+			return
+		topic_url = f'{BASE_URL}/t/topic/{topic_id}/1'
+		self.store.upsert_topic_snapshot(self.account.id, topic_id, topic_title, topic_url)
+		self.store.upsert_post_snapshot(
+			self.account.id,
+			topic_id,
+			post_key,
+			text,
+			author=author,
+			url=f'{BASE_URL}/t/topic/{topic_id}/{post_key}',
+		)
 
 	def daily_counts(self) -> dict[str, int]:
 		if self.store is None or self.account is None:
@@ -799,7 +1064,9 @@ class LinuxDoBrowser:
 		topic_started = time.monotonic()
 		await self.page.goto(topic_url, wait_until='domcontentloaded')
 		await sleep_range((1500, 2500))
-		topic_should_like = False
+		topic_title = await self.current_topic_title()
+		if self.store is not None and self.account is not None:
+			self.store.upsert_topic_snapshot(self.account.id, topic_id, topic_title, topic_url)
 
 		if topic_id not in self.state.viewed_topics:
 			if self.daily_topic_limit_reached():
@@ -810,16 +1077,11 @@ class LinuxDoBrowser:
 			if self.store is not None and self.account is not None:
 				self.store.record_event(self.account.id, 'topic_view', topic_id=topic_id)
 			self.state.save()
-			topic_should_like = self.should_like_topic()
-			if topic_should_like:
-				self.log(f'本话题计划点赞（约每 {self.topic_like_interval()} 个话题 1 次）')
 
 		await self.scroll_to_top()
 		last_scroll_height = await self.get_scroll_height()
 		no_new_content_count = 0
 		viewed_posts: set[str] = set()
-		like_candidate_keys: set[str] = set()
-		like_candidates: list[tuple[int, str, str, Any]] = []
 		topic_pages_viewed = 1
 
 		while self.running:
@@ -855,16 +1117,20 @@ class LinuxDoBrowser:
 					self.state.save()
 				self.heartbeat()
 
+				actual_post_id = await safe_locator_attribute(post, 'data-post-id')
+				post_text = await self.post_text(post)
+				if actual_post_id and post_text:
+					self.record_post_snapshot(
+						topic_id,
+						topic_title,
+						actual_post_id,
+						post_text,
+						await self.post_author(post),
+					)
+
 				read_range = speed['read_ms']
 				if read_range[1] > 0:
 					await sleep_range(tuple(read_range))
-
-				if topic_should_like and post_key not in like_candidate_keys:
-					actual_post_id = await safe_locator_attribute(post, 'data-post-id')
-					if actual_post_id:
-						text_length = await self.post_text_length(post)
-						like_candidates.append((text_length, post_key, actual_post_id, post))
-						like_candidate_keys.add(post_key)
 
 			if await self.is_at_bottom():
 				await sleep_range(tuple(speed['load_wait_ms']))
@@ -889,16 +1155,6 @@ class LinuxDoBrowser:
 			await self.scroll_down(speed, page_scroll=True)
 			topic_pages_viewed += 1
 			await sleep_range(tuple(speed['scroll_interval_ms']))
-
-		if topic_should_like:
-			liked = False
-			for text_length, post_key, actual_post_id, post in sorted(like_candidates, reverse=True)[:5]:
-				self.log(f'准备点赞候选帖子 #{post_key}（正文约 {text_length} 字）')
-				liked = await self.try_like_post(post, post_key, actual_post_id)
-				if liked or self.like_disabled:
-					break
-			if not liked and not self.like_disabled:
-				self.log('本话题未找到可点赞的候选帖子')
 
 		self.record_read_time(topic_id, time.monotonic() - topic_started)
 
@@ -935,6 +1191,7 @@ class LinuxDoBrowser:
 	async def browse_list_until_topic(self) -> str | None:
 		speed = self.config.speed_config
 		last_scroll_height = await self.get_scroll_height()
+		known_topic_ids = await self.loaded_list_topic_ids()
 		no_new_content_count = 0
 
 		while self.running:
@@ -944,18 +1201,24 @@ class LinuxDoBrowser:
 				return topic_id
 
 			if await self.is_at_bottom():
+				await self.nudge_list_loader_at_bottom(speed)
 				await sleep_range(tuple(speed['load_wait_ms']))
 				current_height = await self.get_scroll_height()
-				if current_height > last_scroll_height:
-					last_scroll_height = current_height
+				current_topic_ids = await self.loaded_list_topic_ids()
+				if topic_list_has_new_content(known_topic_ids, current_topic_ids, last_scroll_height, current_height):
+					last_scroll_height = max(last_scroll_height, current_height)
+					known_topic_ids.update(current_topic_ids)
 					no_new_content_count = 0
+					self.log('检测到更多话题加载')
 				else:
 					no_new_content_count += 1
+					self.log(f'列表无新话题 ({no_new_content_count}/{speed["no_new_content_retry"]})')
 					if no_new_content_count >= speed['no_new_content_retry']:
 						self.log('当前列表已到底，刷新列表')
 						await self.page.goto(f'{BASE_URL}{self.config.list_path}', wait_until='domcontentloaded')
 						await sleep_range((1000, 2000))
 						last_scroll_height = await self.get_scroll_height()
+						known_topic_ids = await self.loaded_list_topic_ids()
 						no_new_content_count = 0
 						continue
 			await self.scroll_down(speed)
@@ -1078,6 +1341,19 @@ def build_parser() -> argparse.ArgumentParser:
 	sync_parser = subparsers.add_parser('sync-status', help='Sync status from connect.linux.do')
 	sync_parser.add_argument('--account', help='Account name or slug')
 	sync_parser.add_argument('--headless', action='store_true', help='Run browser headless')
+	review_likes_parser = subparsers.add_parser('review-likes', help='Review like candidates from browsed topics')
+	review_likes_parser.add_argument('--account', help='Account name or slug')
+	review_likes_parser.add_argument('--headless', action='store_true', help='Run browser headless')
+	llm_reply_parser = subparsers.add_parser('llm-reply', help='Generate and review LLM replies for today topics')
+	llm_reply_parser.add_argument('--account', help='Account name or slug')
+	llm_reply_parser.add_argument('--count', type=int, help='Number of topics for LLM to select')
+	llm_reply_parser.add_argument(
+		'--llm-reply',
+		dest='enable_llm_reply',
+		action=argparse.BooleanOptionalAction,
+		help='Enable LLM reply flow for this run',
+	)
+	llm_reply_parser.add_argument('--headless', action='store_true', help='Run browser headless')
 	reply_parser = subparsers.add_parser('reply', help='Record manual replies')
 	reply_subparsers = reply_parser.add_subparsers(dest='reply_command')
 	reply_mark = reply_subparsers.add_parser('mark', help='Mark a topic as manually replied')
@@ -1119,6 +1395,8 @@ def apply_cli_overrides(config: BrowserConfig, args: argparse.Namespace) -> None
 		config.daily_topic_limit = args.daily_topic_limit
 	if getattr(args, 'daily_like_limit', None) is not None:
 		config.daily_like_limit = args.daily_like_limit
+	if getattr(args, 'enable_llm_reply', None) is not None:
+		config.enable_llm_reply = args.enable_llm_reply
 	if getattr(args, 'headless', False):
 		config.headless = True
 	config.validate()
@@ -1206,6 +1484,149 @@ async def try_sync_status_for_account(config: BrowserConfig, store: AccountStore
 	level = '-' if status.current_level is None else str(status.current_level)
 	console.print(f'[green]✓ Connect 状态已同步，当前等级: {level}[/]')
 	return True
+
+
+def like_review_target_remaining(config: BrowserConfig, browser: LinuxDoBrowser) -> int:
+	session_remaining = max(0, config.max_likes_per_session - browser.state.session_liked)
+	if config.daily_like_limit <= 0:
+		return session_remaining
+	if browser.store is None or browser.account is None:
+		return session_remaining
+	daily_remaining = max(0, config.daily_like_limit - browser.daily_counts()['like_given'])
+	return min(session_remaining, daily_remaining)
+
+
+def print_like_candidate(candidate: dict[str, Any], remaining: int) -> None:
+	table = Table(title=f'点赞候选（还需 {remaining} 个）', header_style='bold cyan')
+	table.add_column('字段', no_wrap=True)
+	table.add_column('内容')
+	table.add_row('话题', f'{candidate["topic_title"]} ({candidate["topic_id"]})')
+	table.add_row('帖子', f'#{candidate["post_id"]}')
+	table.add_row('作者', candidate.get('author') or '-')
+	table.add_row('正文', candidate.get('excerpt') or '-')
+	console.print(table)
+	console.print('[dim]y=点赞，n=跳过，r=重新采样，q=退出审核[/]')
+
+
+async def resample_like_candidates(browser: LinuxDoBrowser, target_remaining: int) -> None:
+	original_max_topics = browser.config.max_topics_per_session
+	batch_size = max(3, target_remaining * 2)
+	browser.config.max_topics_per_session = max(original_max_topics, browser.state.session_viewed + batch_size)
+	try:
+		console.print(f'[dim]继续浏览采样 {batch_size} 个左右的话题候选[/]')
+		await browser.run()
+	finally:
+		browser.config.max_topics_per_session = original_max_topics
+
+
+async def review_like_candidates(browser: LinuxDoBrowser, store: AccountStore, account: Account) -> None:
+	if not browser.config.enable_like:
+		return
+	if browser.config.headless or not sys.stdin.isatty():
+		console.print('[yellow]当前不是交互式终端，已跳过点赞审核；候选已保存在本地记录中[/]')
+		return
+
+	skipped_post_ids: set[str] = set()
+	while True:
+		remaining = like_review_target_remaining(browser.config, browser)
+		if remaining <= 0:
+			console.print('[green]点赞数量已达到当前配置目标[/]')
+			return
+
+		candidates = store.like_candidate_posts_for_day(
+			account.id,
+			limit_per_topic=MAX_LIKE_CANDIDATES_PER_TOPIC,
+			exclude_post_ids=skipped_post_ids,
+		)
+		if not candidates:
+			if browser.daily_topic_limit_reached():
+				console.print('[yellow]今日话题浏览上限已达，无法继续采样点赞候选[/]')
+				return
+			if not Confirm.ask(f'点赞候选不足，还差 {remaining} 个，继续浏览重新采样？', default=True):
+				return
+			await resample_like_candidates(browser, remaining)
+			continue
+
+		resample_requested = False
+		for candidate in candidates:
+			remaining = like_review_target_remaining(browser.config, browser)
+			if remaining <= 0:
+				console.print('[green]点赞数量已达到当前配置目标[/]')
+				return
+
+			post_id = str(candidate['post_id'])
+			if post_id in skipped_post_ids or post_id in browser.state.liked_posts:
+				continue
+
+			print_like_candidate(candidate, remaining)
+			choice = Prompt.ask(
+				'操作',
+				choices=['y', 'n', 'r', 'q'],
+				default='n',
+			)
+			if choice == 'q':
+				return
+			if choice == 'r':
+				resample_requested = True
+				break
+
+			skipped_post_ids.add(post_id)
+			if choice != 'y':
+				continue
+
+			await browser.page.goto(candidate['topic_url'] or f'{BASE_URL}/t/topic/{candidate["topic_id"]}/1', wait_until='domcontentloaded')
+			await browser.handle_human_verification()
+			result = await browser.send_like(post_id)
+			if result.get('success'):
+				browser._record_like_success(post_id, topic_id=str(candidate['topic_id']))
+			else:
+				console.print(f'[yellow]点赞失败:[/] {result.get("error")}')
+
+		if resample_requested:
+			await resample_like_candidates(browser, like_review_target_remaining(browser.config, browser))
+
+
+def topic_payloads_for_llm(store: AccountStore, account: Account) -> list[dict[str, str]]:
+	return [
+		{
+			'topic_id': topic.topic_id,
+			'title': topic.title,
+			'url': topic.url,
+		}
+		for topic in store.topic_snapshots_for_day(account.id)
+	]
+
+
+def post_payloads_for_llm(store: AccountStore, account: Account, topic_id: str) -> list[dict[str, str]]:
+	posts = store.post_snapshots_for_topic(account.id, topic_id)[:12]
+	return [
+		{
+			'post_id': post.post_id,
+			'author': post.author or '',
+			'text': post.text[:1200],
+		}
+		for post in posts
+	]
+
+
+def review_reply_text(topic: dict[str, str], reply: str) -> str | None:
+	console.print(
+		Panel(
+			f'[bold]{topic["title"]}[/]\n\n{reply}',
+			title=f'LLM 回复候选 - {topic["topic_id"]}',
+			border_style='cyan',
+		)
+	)
+	console.print('[dim]y=发布，e=编辑后发布，n=跳过，q=退出[/]')
+	choice = Prompt.ask('操作', choices=['y', 'e', 'n', 'q'], default='n')
+	if choice == 'q':
+		raise KeyboardInterrupt
+	if choice == 'n':
+		return None
+	if choice == 'e':
+		edited = Prompt.ask('编辑回复', default=reply).strip()
+		return edited or None
+	return reply
 
 
 async def cmd_login(args: argparse.Namespace) -> int:
@@ -1299,6 +1720,91 @@ async def cmd_import_cookies(args: argparse.Namespace) -> int:
 	return 0
 
 
+async def cmd_review_likes(args: argparse.Namespace) -> int:
+	config = load_config()
+	if getattr(args, 'headless', False):
+		config.headless = True
+	store = get_store()
+	account = resolve_account(store, getattr(args, 'account', None))
+	browser = build_browser_for_account(config, store, account)
+	async with async_playwright() as playwright:
+		try:
+			await browser.launch(playwright)
+			await browser.ensure_logged_in()
+			await review_like_candidates(browser, store, account)
+		finally:
+			await browser.close()
+	return 0
+
+
+async def cmd_llm_reply(args: argparse.Namespace) -> int:
+	config = load_config()
+	if getattr(args, 'enable_llm_reply', None) is not None:
+		config.enable_llm_reply = args.enable_llm_reply
+	if not config.enable_llm_reply:
+		console.print('[dim]LLM 评论已关闭[/]')
+		return 0
+	if getattr(args, 'headless', False):
+		config.headless = True
+	reply_count = getattr(args, 'count', None) or config.llm_topic_count
+	store = get_store()
+	account = resolve_account(store, getattr(args, 'account', None))
+	topics = topic_payloads_for_llm(store, account)
+	if not topics:
+		console.print('[yellow]今天还没有可用于 LLM 评论的话题快照，请先运行浏览流程[/]')
+		return 1
+
+	try:
+		selected_topic_ids = select_llm_topic_ids(config, topics, reply_count)
+	except Exception as exc:
+		error_console.print(f'[bold red]LLM 话题筛选失败:[/] {exc}')
+		return 1
+
+	if not selected_topic_ids:
+		console.print('[yellow]LLM 没有选出可回复的话题[/]')
+		return 1
+
+	topics_by_id = {topic['topic_id']: topic for topic in topics}
+	approved_replies: list[tuple[dict[str, str], str]] = []
+	for topic_id in selected_topic_ids:
+		topic = topics_by_id[topic_id]
+		posts = post_payloads_for_llm(store, account, topic_id)
+		try:
+			reply = generate_llm_reply(config, topic, posts)
+		except Exception as exc:
+			console.print(f'[yellow]生成话题 {topic_id} 回复失败:[/] {exc}')
+			continue
+		try:
+			final_reply = review_reply_text(topic, reply)
+		except KeyboardInterrupt:
+			break
+		if final_reply:
+			approved_replies.append((topic, final_reply))
+
+	if not approved_replies:
+		console.print('[dim]没有确认发布的回复[/]')
+		return 0
+
+	browser = build_browser_for_account(config, store, account)
+	async with async_playwright() as playwright:
+		try:
+			await browser.launch(playwright)
+			await browser.ensure_logged_in()
+			for topic, reply in approved_replies:
+				await browser.page.goto(topic['url'] or f'{BASE_URL}/t/topic/{topic["topic_id"]}/1', wait_until='domcontentloaded')
+				await browser.handle_human_verification()
+				result = await browser.send_reply(topic['topic_id'], reply)
+				if result.get('success'):
+					store.record_event(account.id, 'llm_reply', topic_id=topic['topic_id'], post_id=result.get('post_id'))
+					console.print(f'[green]已发布回复:[/] {topic["title"]}')
+				else:
+					console.print(f'[yellow]回复失败 {topic["topic_id"]}:[/] {result.get("error")}')
+		finally:
+			await browser.close()
+	cmd_status_for_account(store, account)
+	return 0
+
+
 async def cmd_run(args: argparse.Namespace) -> int:
 	config = load_config()
 	apply_cli_overrides(config, args)
@@ -1326,6 +1832,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
 			try:
 				await browser.launch(playwright)
 				await browser.run()
+				await review_like_candidates(browser, store, account)
 			finally:
 				await browser.close()
 	except KeyboardInterrupt:
@@ -1430,7 +1937,10 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
 def cmd_config() -> int:
 	config = load_config()
-	console.print_json(json.dumps(asdict(config), ensure_ascii=False, indent=2))
+	payload = asdict(config)
+	if payload.get('llm_api_key'):
+		payload['llm_api_key'] = '***'
+	console.print_json(json.dumps(payload, ensure_ascii=False, indent=2))
 	return 0
 
 
@@ -1599,12 +2109,14 @@ def tui_args(command: str, **overrides: Any) -> argparse.Namespace:
 		'min_read_minutes': None,
 		'daily_topic_limit': None,
 		'daily_like_limit': None,
+		'enable_llm_reply': None,
 		'accounts_command': None,
 		'name': None,
 		'target_level': 2,
 		'offline': False,
 		'reply_command': None,
 		'topic_id': None,
+		'count': None,
 		'yes': False,
 		'cookies': None,
 		'file': None,
@@ -1767,6 +2279,22 @@ def tui_edit_config() -> None:
 	console.print('[green]配置已保存[/]')
 
 
+def tui_edit_llm_config() -> None:
+	config = load_config()
+	config.enable_llm_reply = Confirm.ask('默认开启 LLM 评论', default=config.enable_llm_reply)
+	config.llm_base_url = Prompt.ask('OPENAI_BASE_URL', default=config.llm_base_url).strip()
+	config.llm_model = Prompt.ask('OPENAI_MODEL', default=config.llm_model).strip()
+	api_key_label = 'OPENAI_API_KEY（留空保持不变）'
+	api_key = Prompt.ask(api_key_label, default='', password=True, show_default=False).strip()
+	if api_key:
+		config.llm_api_key = api_key
+	config.llm_topic_count = tui_prompt_int('默认筛选话题数 N', config.llm_topic_count, 1)
+	config.llm_reply_max_chars = tui_prompt_int('回复最大字数', config.llm_reply_max_chars, 20)
+	config.validate()
+	save_config(config)
+	console.print('[green]LLM 配置已保存[/]')
+
+
 async def tui_accounts_menu() -> None:
 	while True:
 		choice = tui_menu(
@@ -1819,6 +2347,8 @@ async def tui_browse_menu() -> None:
 				('2', '选择账号并自定义本次运行'),
 				('3', '运行所有启用账号（当前配置）'),
 				('4', '运行所有启用账号（自定义本次运行）'),
+				('5', '审核今日点赞候选'),
+				('6', '生成并审核 LLM 回复'),
 				('0', '返回主菜单'),
 			],
 		)
@@ -1841,6 +2371,20 @@ async def tui_browse_menu() -> None:
 		elif choice == '4':
 			await cmd_run_all(tui_collect_run_args(None, command='run-all'))
 			tui_pause()
+		elif choice == '5':
+			store = get_store()
+			account = tui_select_account(store)
+			if account is not None:
+				await cmd_review_likes(tui_args('review-likes', account=account))
+				tui_pause()
+		elif choice == '6':
+			store = get_store()
+			account = tui_select_account(store)
+			if account is not None:
+				config = load_config()
+				count = tui_prompt_int('筛选话题数 N', config.llm_topic_count, 1)
+				await cmd_llm_reply(tui_args('llm-reply', account=account, count=count))
+				tui_pause()
 
 
 async def tui_status_menu() -> None:
@@ -1883,6 +2427,7 @@ def tui_config_menu() -> None:
 			[
 				('1', '查看当前配置'),
 				('2', '编辑默认配置'),
+				('3', '编辑 LLM 配置'),
 				('0', '返回主菜单'),
 			],
 		)
@@ -1892,6 +2437,8 @@ def tui_config_menu() -> None:
 			cmd_config()
 		elif choice == '2':
 			tui_edit_config()
+		elif choice == '3':
+			tui_edit_llm_config()
 		tui_pause()
 
 
@@ -1980,6 +2527,10 @@ async def async_main(args: argparse.Namespace) -> int:
 		return await cmd_status(args)
 	if command == 'sync-status':
 		return await cmd_sync_status(args)
+	if command == 'review-likes':
+		return await cmd_review_likes(args)
+	if command == 'llm-reply':
+		return await cmd_llm_reply(args)
 	if command == 'reply':
 		return cmd_reply(args)
 	if command == 'clear':
@@ -2002,5 +2553,7 @@ def main() -> int:
 	return asyncio.run(async_main(args))
 
 
+if __name__ == '__main__':
+	raise SystemExit(main())
 if __name__ == '__main__':
 	raise SystemExit(main())

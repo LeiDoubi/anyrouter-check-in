@@ -10,7 +10,9 @@
 - 浏览流程：打开列表、进入未浏览话题、滚动阅读帖子/楼层
 - 本地统计：记录话题、帖子、阅读分钟、运行 session
 - 保守限额：支持单次和本地每日话题/点赞上限
-- 话题级点赞：进入话题时决定是否点赞，优先点赞已浏览内容里正文较长的帖子
+- 话题级点赞：优先从已浏览内容里正文较长的帖子生成候选
+- 点赞审核：浏览完成后按今日浏览话题生成候选，每个话题最多 2 个帖子，人工确认后才点赞
+- LLM 评论：用 OpenAI-compatible 模型筛选今日高价值话题，生成回复候选，人工确认或编辑后发布
 - Connect 状态：从 `https://connect.linux.do` 同步当前等级和升级进度提示
 - 数据管理：支持清理账号记录和完全重置本地测试数据
 
@@ -42,6 +44,7 @@ TUI 主菜单包含：
 
 - 账号管理：账号列表、新增账号并登录、刷新登录、导入 Cookie
 - 浏览执行：按当前配置运行、自定义本次运行、运行所有启用账号
+- 审核与回复：审核今日点赞候选、生成并审核 LLM 回复
 - 浏览执行的账号选择表会显示“今日执行”和“上次执行”
 - 状态与统计：同步 Connect 状态、查看本地缓存、浏览统计、记录手动回复
 - 配置：查看或编辑默认速度、列表、话题上限、点赞节奏
@@ -124,6 +127,8 @@ uv run linuxdo-browser status --account main
 | `linuxdo-browser login` | 打开浏览器手动登录 |
 | `linuxdo-browser run` | 运行一次浏览测试 |
 | `linuxdo-browser run-all` | 顺序运行所有启用账号 |
+| `linuxdo-browser review-likes` | 审核今日点赞候选 |
+| `linuxdo-browser llm-reply` | 生成并审核 LLM 回复 |
 | `linuxdo-browser status` | 打开浏览器同步 Connect 状态并展示进度 |
 | `linuxdo-browser status --offline` | 只读取本地缓存状态 |
 | `linuxdo-browser sync-status` | 只同步 Connect 状态 |
@@ -158,6 +163,22 @@ uv run linuxdo-browser run \
 | `--like` / `--no-like` | 开启 | 是否执行点赞流程 |
 | `--like-chance` | `medium` | 无每日限额时的备用点赞节奏；同时设置话题/点赞日限额时优先按两者比例调度 |
 | `--headless` | 关闭 | 无头运行，验证码测试环境不推荐 |
+
+开启点赞时，脚本不会在浏览过程中直接点赞。浏览达到本次话题/阅读分钟等条件后，会从今日浏览话题里生成点赞候选，每个话题最多 2 个帖子；TUI 中选择 `y` 才会真正点赞。如果候选不足以达到当前点赞数量配置，可以继续浏览重新采样。
+
+LLM 评论流程会读取今日浏览过的话题标题，让模型筛选 `N` 个高价值话题，再基于已采集到的帖子内容生成回复候选。审核时可以直接发布、编辑后发布、跳过或退出。
+
+`enable_llm_reply` 默认开启；关闭后 `llm-reply` 会直接跳过。可以在 TUI 的“配置 -> 编辑 LLM 配置”中修改，也可以用 `linuxdo-browser llm-reply --no-llm-reply` 临时关闭本次执行。
+
+LLM 默认使用 OpenAI-compatible Chat Completions：
+
+```bash
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+OPENAI_MODEL=qwen3.6-plus
+OPENAI_API_KEY=sk-xxx
+```
+
+也可以在 TUI 的“配置 -> 编辑 LLM 配置”中保存这些参数。`linuxdo-browser config` 会对已保存的 API Key 脱敏显示。
 
 ## 配置与数据
 

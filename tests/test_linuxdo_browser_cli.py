@@ -6,7 +6,10 @@ from scripts.linuxdo.linuxdo_browser import (
 	BrowserState,
 	LinuxDoBrowser,
 	build_parser,
+	extract_json_payload,
+	normalize_openai_base_url,
 	sync_status_for_account,
+	topic_list_has_new_content,
 	tui_args,
 )
 
@@ -83,6 +86,21 @@ def test_parser_accepts_status_sync_and_reset_commands():
 	assert default_args.command is None
 
 
+def test_parser_accepts_review_and_llm_reply_commands():
+	parser = build_parser()
+
+	review_args = parser.parse_args(['review-likes', '--account', 'main'])
+	llm_args = parser.parse_args(['llm-reply', '--account', 'main', '--count', '2'])
+	no_llm_args = parser.parse_args(['llm-reply', '--account', 'main', '--no-llm-reply'])
+
+	assert review_args.command == 'review-likes'
+	assert review_args.account == 'main'
+	assert llm_args.command == 'llm-reply'
+	assert llm_args.count == 2
+	assert llm_args.enable_llm_reply is None
+	assert no_llm_args.enable_llm_reply is False
+
+
 def test_tui_args_provides_cli_defaults():
 	args = tui_args('run', account='main')
 
@@ -91,6 +109,59 @@ def test_tui_args_provides_cli_defaults():
 	assert args.headless is False
 	assert args.max_topics is None
 	assert args.enable_like is None
+	assert args.enable_llm_reply is None
+
+
+def test_browser_config_enables_llm_reply_by_default():
+	assert BrowserConfig().enable_llm_reply is True
+
+
+def test_openai_base_url_normalization_and_json_extraction():
+	assert normalize_openai_base_url('https://dashscope.aliyuncs.com/compatible-mode/v1') == (
+		'https://dashscope.aliyuncs.com/compatible-mode/v1'
+	)
+	assert normalize_openai_base_url('https://example.com/openai') == 'https://example.com/openai/v1'
+	assert extract_json_payload('```json\n{"reply": "ok"}\n```') == {'reply': 'ok'}
+
+
+def test_topic_list_detects_new_ids_without_height_change():
+	assert topic_list_has_new_content({'101', '102'}, {'101', '102', '103'}, 3000, 3000) is True
+	assert topic_list_has_new_content({'101', '102'}, {'101', '102'}, 3000, 3600) is True
+	assert topic_list_has_new_content({'101', '102'}, {'101', '102'}, 3000, 3000) is False
+
+
+@pytest.mark.asyncio
+async def test_scroll_down_uses_mouse_wheel():
+	class FakeMouse:
+		def __init__(self):
+			self.moves = []
+			self.wheels = []
+
+		async def move(self, x, y):
+			self.moves.append((x, y))
+
+		async def wheel(self, delta_x, delta_y):
+			self.wheels.append((delta_x, delta_y))
+
+	class FakePage:
+		viewport_size = {'width': 1000, 'height': 800}
+
+		def __init__(self):
+			self.mouse = FakeMouse()
+
+		async def evaluate(self, *_args):
+			raise AssertionError('scroll_down should use mouse wheel before JS fallback')
+
+	page = FakePage()
+	browser = LinuxDoBrowser(BrowserConfig(), BrowserState())
+	browser._page = page
+
+	await browser.scroll_down({'scroll_step': 400})
+
+	assert page.mouse.moves
+	assert page.mouse.wheels
+	assert page.mouse.wheels[0][0] == 0
+	assert page.mouse.wheels[0][1] > 0
 
 
 def test_browser_config_validates_target_level():
