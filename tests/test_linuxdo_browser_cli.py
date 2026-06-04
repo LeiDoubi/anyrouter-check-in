@@ -11,6 +11,12 @@ from scripts.linuxdo.linuxdo_browser import (
 )
 
 
+def test_legacy_entrypoint_module_exports_main():
+	from scripts import linuxdo_browser as legacy_linuxdo_browser
+
+	assert legacy_linuxdo_browser.main is linuxdo_browser.main
+
+
 def test_parser_accepts_account_commands():
 	parser = build_parser()
 
