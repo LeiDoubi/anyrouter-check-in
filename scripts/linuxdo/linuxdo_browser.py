@@ -1815,10 +1815,14 @@ def read_terminal_key(fd: int, decoder: codecs.IncrementalDecoder) -> str:
 			while len(sequence) < 8 and select_module.select([fd], [], [], 0.02)[0]:
 				sequence.extend(os.read(fd, 1))
 				if sequence.endswith(b'~') or bytes(sequence) in {
+					b'\x1b[A',
+					b'\x1b[B',
 					b'\x1b[D',
 					b'\x1b[C',
 					b'\x1b[H',
 					b'\x1b[F',
+					b'\x1bOA',
+					b'\x1bOB',
 					b'\x1bOD',
 					b'\x1bOC',
 					b'\x1bOH',
@@ -1827,6 +1831,10 @@ def read_terminal_key(fd: int, decoder: codecs.IncrementalDecoder) -> str:
 					break
 			sequence_bytes = bytes(sequence)
 			return {
+				b'\x1b[A': 'up',
+				b'\x1bOA': 'up',
+				b'\x1b[B': 'down',
+				b'\x1bOB': 'down',
 				b'\x1b[D': 'left',
 				b'\x1bOD': 'left',
 				b'\x1b[C': 'right',
@@ -2434,6 +2442,26 @@ def tui_clear_screen() -> None:
 		console.clear()
 
 
+def tui_keyboard_selection_available() -> bool:
+	return (
+		termios is not None
+		and tty is not None
+		and console.is_terminal
+		and sys.stdin.isatty()
+		and sys.stdout.isatty()
+	)
+
+
+def tui_selected_row_style(key: str, selected_key: str | None) -> str | None:
+	return 'bold black on cyan' if key == selected_key else None
+
+
+def tui_selected_key_cell(key: str, selected_key: str | None) -> Text:
+	if key == selected_key:
+		return Text(f'> {key}', style='bold black on cyan')
+	return Text(f'  {key}')
+
+
 def tui_args(command: str, **overrides: Any) -> argparse.Namespace:
 	defaults: dict[str, Any] = {
 		'command': command,
@@ -2465,16 +2493,105 @@ def tui_args(command: str, **overrides: Any) -> argparse.Namespace:
 	return argparse.Namespace(**defaults)
 
 
-def tui_menu(title: str, options: list[tuple[str, str]], default: str = '0', *, clear_screen: bool = True) -> str:
-	if clear_screen:
-		tui_clear_screen()
-	table = Table(title=title, header_style='bold cyan')
-	table.add_column('选择', justify='center', no_wrap=True)
-	table.add_column('操作')
-	for key, label in options:
-		table.add_row(key, label)
-	console.print(table)
-	return Prompt.ask('请选择', choices=[key for key, _ in options], default=default)
+def tui_prompt_choice(
+	keys: list[str],
+	default: str,
+	render: Any,
+	*,
+	clear_screen: bool = True,
+	prompt_label: str = '请选择',
+) -> str:
+	if not tui_keyboard_selection_available():
+		if clear_screen:
+			tui_clear_screen()
+		render(None)
+		return Prompt.ask(prompt_label, choices=keys, default=default)
+
+	selected_index = keys.index(default) if default in keys else 0
+	digit_buffer = ''
+	fd = sys.stdin.fileno()
+	old_settings = termios.tcgetattr(fd)  # type: ignore[union-attr]
+
+	def redraw() -> None:
+		if clear_screen:
+			tui_clear_screen()
+		render(keys[selected_index])
+		console.print('[dim]↑/↓ 选择，Enter 确认；数字直选，0/q 返回[/]')
+
+	def finish(choice: str) -> str:
+		sys.stdout.write('\n')
+		sys.stdout.flush()
+		return choice
+
+	try:
+		tty.setraw(fd)  # type: ignore[union-attr]
+		decoder = codecs.getincrementaldecoder('utf-8')('ignore')
+		redraw()
+		while True:
+			key = read_terminal_key(fd, decoder)
+			if key == 'enter':
+				return finish(keys[selected_index])
+			if key == 'eof':
+				return finish(default)
+			if key == 'up':
+				selected_index = (selected_index - 1) % len(keys)
+				digit_buffer = ''
+			elif key == 'down':
+				selected_index = (selected_index + 1) % len(keys)
+				digit_buffer = ''
+			elif key == 'home':
+				selected_index = 0
+				digit_buffer = ''
+			elif key == 'end':
+				selected_index = len(keys) - 1
+				digit_buffer = ''
+			elif key.lower() == 'q' and '0' in keys:
+				return finish('0')
+			elif len(key) == 1 and key.isdigit():
+				digit_buffer += key
+				matching_keys = [choice for choice in keys if choice.startswith(digit_buffer)]
+				if not matching_keys:
+					digit_buffer = key if key in keys else ''
+					matching_keys = [choice for choice in keys if choice.startswith(digit_buffer)]
+				if digit_buffer in keys:
+					selected_index = keys.index(digit_buffer)
+					has_longer_match = any(choice != digit_buffer and choice.startswith(digit_buffer) for choice in keys)
+					if not has_longer_match:
+						return finish(digit_buffer)
+				elif matching_keys:
+					selected_index = keys.index(matching_keys[0])
+			else:
+				digit_buffer = ''
+				if key in keys:
+					return finish(key)
+			redraw()
+	finally:
+		termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)  # type: ignore[union-attr]
+
+
+def tui_menu(
+	title: str,
+	options: list[tuple[str, str]],
+	default: str = '0',
+	*,
+	clear_screen: bool = True,
+	header: Any | None = None,
+) -> str:
+	def render(selected_key: str | None) -> None:
+		if header is not None:
+			console.print(header)
+		table = Table(title=title, header_style='bold cyan')
+		table.add_column('选择', justify='center', no_wrap=True)
+		table.add_column('操作')
+		for key, label in options:
+			table.add_row(
+				tui_selected_key_cell(key, selected_key),
+				Text(label),
+				style=tui_selected_row_style(key, selected_key),
+			)
+		console.print(table)
+
+	return tui_prompt_choice([key for key, _ in options], default, render, clear_screen=clear_screen)
 
 
 def tui_prompt_int(label: str, default: int, minimum: int = 0, maximum: int | None = None) -> int:
@@ -2529,52 +2646,53 @@ def tui_select_account(
 	show_llm_candidates: bool = False,
 	clear_screen: bool = True,
 ) -> str | None:
-	if clear_screen:
-		tui_clear_screen()
 	accounts = store.list_accounts()
 	if not accounts:
 		accounts = [store.get_or_create_default_account()]
 	run_statuses = account_run_statuses(store, accounts) if show_run_status else {}
 	llm_counts = llm_candidate_counts(store, accounts) if show_llm_candidates else {}
 
-	table = Table(title=title, header_style='bold cyan')
-	table.add_column('选择', justify='center', no_wrap=True)
-	table.add_column('名称')
-	table.add_column('Slug')
-	table.add_column('用户名')
-	table.add_column('目标等级', justify='right')
-	if show_llm_candidates:
-		table.add_column('LLM候选', justify='right')
-	if show_run_status:
-		table.add_column('今日执行', justify='center')
-		table.add_column('上次执行', no_wrap=True)
-	for index, account in enumerate(accounts, start=1):
-		row: list[str | Text] = [
-			str(index),
-			account.name,
-			account.slug,
-			account.username or '-',
-			str(account.target_level),
-		]
-		if show_llm_candidates:
-			row.append(str(llm_counts.get(account.id, 0)))
-		if show_run_status:
-			has_run_today, last_run = run_statuses[account.id]
-			row.extend([Text('🟢') if has_run_today else Text('', style='dim'), last_run])
-		table.add_row(*row)
-	if allow_cancel:
-		row = ['0', '返回', '-', '-', '-']
-		if show_llm_candidates:
-			row.append('-')
-		if show_run_status:
-			row.extend(['-', '-'])
-		table.add_row(*row)
-	console.print(table)
-
 	choices = [str(index) for index in range(1, len(accounts) + 1)]
 	if allow_cancel:
 		choices.append('0')
-	choice = Prompt.ask('请选择账号', choices=choices, default='1')
+
+	def render(selected_key: str | None) -> None:
+		table = Table(title=title, header_style='bold cyan')
+		table.add_column('选择', justify='center', no_wrap=True)
+		table.add_column('名称')
+		table.add_column('Slug')
+		table.add_column('用户名')
+		table.add_column('目标等级', justify='right')
+		if show_llm_candidates:
+			table.add_column('LLM候选', justify='right')
+		if show_run_status:
+			table.add_column('今日执行', justify='center')
+			table.add_column('上次执行', no_wrap=True)
+		for index, account in enumerate(accounts, start=1):
+			key = str(index)
+			row: list[str | Text] = [
+				tui_selected_key_cell(key, selected_key),
+				account.name,
+				account.slug,
+				account.username or '-',
+				str(account.target_level),
+			]
+			if show_llm_candidates:
+				row.append(str(llm_counts.get(account.id, 0)))
+			if show_run_status:
+				has_run_today, last_run = run_statuses[account.id]
+				row.extend([Text('🟢') if has_run_today else Text('', style='dim'), last_run])
+			table.add_row(*row, style=tui_selected_row_style(key, selected_key))
+		if allow_cancel:
+			row = [tui_selected_key_cell('0', selected_key), '返回', '-', '-', '-']
+			if show_llm_candidates:
+				row.append('-')
+			if show_run_status:
+				row.extend(['-', '-'])
+			table.add_row(*row, style=tui_selected_row_style('0', selected_key))
+		console.print(table)
+
+	choice = tui_prompt_choice(choices, '1', render, clear_screen=clear_screen, prompt_label='请选择账号')
 	if choice == '0':
 		return None
 	return accounts[int(choice) - 1].slug
@@ -2826,16 +2944,13 @@ def tui_data_menu() -> None:
 
 async def cmd_tui(args: argparse.Namespace) -> int:
 	_ = args
+	header = Panel(
+		'使用数字选择子菜单；现有 CLI 命令仍可直接调用。',
+		title='Linux.do TUI',
+		border_style='bright_blue',
+	)
 	while True:
 		try:
-			tui_clear_screen()
-			console.print(
-				Panel(
-					'使用数字选择子菜单；现有 CLI 命令仍可直接调用。',
-					title='Linux.do TUI',
-					border_style='bright_blue',
-				)
-			)
 			choice = tui_menu(
 				'主菜单',
 				[
@@ -2846,7 +2961,7 @@ async def cmd_tui(args: argparse.Namespace) -> int:
 					('5', '数据管理'),
 					('0', '退出'),
 				],
-				clear_screen=False,
+				header=header,
 			)
 			if choice == '0':
 				console.print('[dim]已退出[/]')

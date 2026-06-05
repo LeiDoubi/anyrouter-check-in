@@ -53,8 +53,8 @@ CODEX_DIR = Path.home() / '.codex'
 CODEX_AUTH_FILE = CODEX_DIR / 'auth.json'
 CODEX_CONFIG_FILE = CODEX_DIR / 'config.toml'
 DEPLOY_SCRIPT_FILE = Path.home() / 'Downloads' / 'anyrouter-deploy-current.sh'
-DEFAULT_BASE_URL = 'https://anyrouter.top'
-CODEX_CONFIG_TEMPLATE = """model = "gpt-5-codex"
+DEFAULT_BASE_URL = 'https://a-ocnfniawgw.cn-shanghai.fcapp.run'
+CODEX_CONFIG_TEMPLATE = """model = "gpt-5.5"
 model_provider = "anyrouter"
 preferred_auth_method = "apikey"
 approval_policy = "never"
@@ -89,6 +89,8 @@ CLAUDE_SETTINGS_FILE="${{CLAUDE_DIR}}/settings.json"
 CODEX_DIR="${{HOME}}/.codex"
 CODEX_AUTH_FILE="${{CODEX_DIR}}/auth.json"
 CODEX_CONFIG_FILE="${{CODEX_DIR}}/config.toml"
+NPM_USER_PREFIX="${{NPM_CONFIG_PREFIX:-${{HOME}}/.npm-global}}"
+NEEDS_NPM_USER_PATH=0
 
 HOOK_START='# >>> anyrouter-check-in >>>'
 HOOK_END='# <<< anyrouter-check-in <<<'
@@ -106,6 +108,67 @@ json_escape() {{
   value=${{value//\"/\\\"}}
   value=${{value//$'\n'/\\n}}
   printf '%s' "$value"
+}}
+
+ensure_npm_available() {{
+  if command -v npm >/dev/null 2>&1; then
+    return 0
+  fi
+
+  printf 'ERROR: npm is required to install missing Claude Code/Codex clients.\n' >&2
+  printf 'Install Node.js/npm first, then rerun this deploy script.\n' >&2
+  return 1
+}}
+
+prepend_path_once() {{
+  local dir="$1"
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *) export PATH="$dir:$PATH" ;;
+  esac
+}}
+
+install_npm_cli() {{
+  local label="$1"
+  local binary="$2"
+  local package="$3"
+
+  if command -v "$binary" >/dev/null 2>&1; then
+    printf '%s found: %s\n' "$label" "$(command -v "$binary")"
+    return 0
+  fi
+
+  ensure_npm_available
+  printf '%s not found; installing %s...\n' "$label" "$package"
+
+  if npm install -g "$package"; then
+    hash -r 2>/dev/null || true
+  fi
+
+  if command -v "$binary" >/dev/null 2>&1; then
+    printf '%s installed: %s\n' "$label" "$(command -v "$binary")"
+    return 0
+  fi
+
+  printf 'Global npm install did not expose %s; retrying with user prefix %s...\n' "$binary" "$NPM_USER_PREFIX"
+  mkdir -p "$NPM_USER_PREFIX"
+  NPM_CONFIG_PREFIX="$NPM_USER_PREFIX" npm install -g "$package"
+  prepend_path_once "$NPM_USER_PREFIX/bin"
+  NEEDS_NPM_USER_PATH=1
+  hash -r 2>/dev/null || true
+
+  if ! command -v "$binary" >/dev/null 2>&1; then
+    printf 'ERROR: %s installation finished but %s is still not on PATH.\n' "$label" "$binary" >&2
+    printf 'Expected binary under %s/bin. Check npm output above.\n' "$NPM_USER_PREFIX" >&2
+    return 1
+  fi
+
+  printf '%s installed: %s\n' "$label" "$(command -v "$binary")"
+}}
+
+ensure_clients() {{
+  install_npm_cli 'Claude Code' 'claude' '@anthropic-ai/claude-code'
+  install_npm_cli 'Codex CLI' 'codex' '@openai/codex'
 }}
 
 ensure_shell_hook() {{
@@ -247,6 +310,7 @@ PY
 
 main() {{
   mkdir -p "$STATE_DIR" "$CLAUDE_DIR" "$CODEX_DIR"
+  ensure_clients
 
   backup_file "$ENV_FILE"
   cat > "$ENV_FILE" <<EOF
@@ -256,6 +320,9 @@ export ANTHROPIC_BASE_URL="${{ANYROUTER_BASE_URL}}"
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 EOF
+  if [[ "$NEEDS_NPM_USER_PATH" == "1" ]]; then
+    printf 'export PATH="%s/bin:${{PATH}}"\n' "$NPM_USER_PREFIX" >> "$ENV_FILE"
+  fi
 
   backup_file "$ACTIVE_FILE"
   cat > "$ACTIVE_FILE" <<EOF
@@ -284,6 +351,8 @@ EOF
   printf 'Claude Code settings: %s\n' "$CLAUDE_SETTINGS_FILE"
   printf 'Codex auth: %s\n' "$CODEX_AUTH_FILE"
   printf 'Codex config: %s\n' "$CODEX_CONFIG_FILE"
+  printf 'Claude Code client: %s\n' "$(command -v claude)"
+  printf 'Codex client: %s\n' "$(command -v codex)"
   printf '\nRun this in the current shell to apply immediately:\n'
   printf '  source "%s"\n\n' "$ENV_FILE"
 }}

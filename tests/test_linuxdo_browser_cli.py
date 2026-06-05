@@ -1,3 +1,6 @@
+import codecs
+import os
+
 import pytest
 
 from scripts.linuxdo import linuxdo_browser
@@ -151,6 +154,18 @@ def test_tui_menu_clears_terminal_before_render(monkeypatch):
 	assert choice == '0'
 	assert fake_console.cleared == 1
 	assert fake_console.rendered
+
+
+def test_read_terminal_key_maps_up_and_down_arrows():
+	decoder = codecs.getincrementaldecoder('utf-8')('ignore')
+	read_fd, write_fd = os.pipe()
+	try:
+		os.write(write_fd, b'\x1b[A\x1b[B')
+		assert linuxdo_browser.read_terminal_key(read_fd, decoder) == 'up'
+		assert linuxdo_browser.read_terminal_key(read_fd, decoder) == 'down'
+	finally:
+		os.close(read_fd)
+		os.close(write_fd)
 
 
 def test_browser_config_enables_llm_reply_by_default():
