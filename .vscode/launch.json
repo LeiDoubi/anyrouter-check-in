@@ -1,0 +1,51 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "linuxdo-browser: llm-reply default account",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "scripts.linuxdo.linuxdo_browser",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "envFile": "${workspaceFolder}/.env",
+      "args": [
+        "llm-reply",
+        "--count",
+        "${input:llmTopicCount}"
+      ]
+    },
+    {
+      "name": "linuxdo-browser: llm-reply selected account",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "scripts.linuxdo.linuxdo_browser",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "envFile": "${workspaceFolder}/.env",
+      "args": [
+        "llm-reply",
+        "--account",
+        "${input:linuxdoAccount}",
+        "--count",
+        "${input:llmTopicCount}"
+      ]
+    }
+  ],
+  "inputs": [
+    {
+      "id": "linuxdoAccount",
+      "type": "promptString",
+      "description": "Linux.do account name or slug",
+      "default": "main"
+    },
+    {
+      "id": "llmTopicCount",
+      "type": "promptString",
+      "description": "Number of topics to ask the LLM to select",
+      "default": "3"
+    }
+  ]
+}

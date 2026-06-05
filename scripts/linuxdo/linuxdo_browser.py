@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import codecs
 import contextlib
 import json
 import os
 import platform
 import random
 import re
+import select as select_module
 import shutil
 import sys
 import time
@@ -26,13 +28,13 @@ from urllib.parse import urljoin
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from playwright.async_api import BrowserContext
+from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Page, Playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from playwright.async_api import async_playwright
+from rich.cells import cell_len
 from rich.console import Console
 from rich.panel import Panel
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 from rich.text import Text
@@ -44,6 +46,13 @@ from scripts.linuxdo.linuxdo_store import Account, AccountStore, ConnectSnapshot
 
 console = Console()
 error_console = Console(stderr=True)
+
+try:
+	import termios
+	import tty
+except ImportError:  # pragma: no cover - terminal editing is unavailable on some platforms
+	termios = None
+	tty = None
 
 BASE_URL = 'https://linux.do'
 CONNECT_URL = 'https://connect.linux.do'
@@ -138,6 +147,7 @@ VERIFY_BUTTON_SELECTORS = (
 )
 
 MAX_LIKE_CANDIDATES_PER_TOPIC = 2
+LLM_PROCESSED_EVENT_TYPES = {'llm_processed', 'llm_reply'}
 
 
 @dataclass
@@ -308,7 +318,7 @@ def extract_json_payload(text: str) -> Any:
 	raise ValueError('LLM 未返回可解析的 JSON')
 
 
-def llm_chat_json(config: BrowserConfig, messages: list[dict[str, str]]) -> Any:
+def llm_chat_json(config: BrowserConfig, messages: list[dict[str, str]], *, temperature: float = 0.35) -> Any:
 	base_url, model, api_key = effective_llm_settings(config)
 	if not base_url or not model or not api_key:
 		raise RuntimeError('LLM 配置不完整，请在 TUI 配置 OPENAI_BASE_URL / OPENAI_MODEL / OPENAI_API_KEY')
@@ -316,7 +326,7 @@ def llm_chat_json(config: BrowserConfig, messages: list[dict[str, str]]) -> Any:
 	response = client.chat.completions.create(
 		model=model,
 		messages=messages,
-		temperature=0.35,
+		temperature=temperature,
 	)
 	content = response.choices[0].message.content or ''
 	return extract_json_payload(content)
@@ -361,7 +371,10 @@ def generate_llm_reply(config: BrowserConfig, topic: dict[str, str], posts: list
 				'role': 'system',
 				'content': (
 					'你是谨慎的中文论坛回复助手。只返回 JSON。'
-					'生成一条自然、具体、低姿态的回复，不要编造个人经历，不要使用营销语气，不要重复题主原文。'
+					'写得像 Linux.do 普通用户顺手回帖，不像客服、律师、公众号或知识库总结。'
+					'回复 1 到 2 句，口语化、短句、有一点个人判断，但不要编造亲身经历。'
+					'少用“建议”“关键”“风险点”“涉刑责”“难免责”“态度客气但别松口”等生硬套话。'
+					'不要复述题目，不要上纲上线，不要给确定法律结论, 对于技术话题可以适当给出技术性建议。但是对于灌水的话题，就得用调皮的语气回复。'
 				),
 			},
 			{
@@ -377,6 +390,7 @@ def generate_llm_reply(config: BrowserConfig, topic: dict[str, str], posts: list
 				),
 			},
 		],
+		temperature=0.65,
 	)
 	reply = payload.get('reply') if isinstance(payload, dict) else None
 	if not isinstance(reply, str) or not reply.strip():
@@ -423,6 +437,25 @@ def scale_speed_config(speed: dict[str, Any], delay_factor: float, scroll_factor
 def get_topic_id_from_url(url: str) -> str | None:
 	match = TOPIC_ID_PATTERN.search(url)
 	return match.group(1) if match else None
+
+
+def parse_positive_int(value: Any) -> int | None:
+	if value is None:
+		return None
+	try:
+		parsed = int(str(value).replace(',', '').strip())
+	except (TypeError, ValueError):
+		return None
+	return parsed if parsed > 0 else None
+
+
+def next_topic_post_number(viewed_post_numbers: set[int], highest_post_number: int | None) -> int | None:
+	if highest_post_number is None or highest_post_number <= 0 or not viewed_post_numbers:
+		return None
+	next_post_number = max(viewed_post_numbers) + 1
+	if next_post_number > highest_post_number:
+		return None
+	return next_post_number
 
 
 def topic_list_has_new_content(
@@ -835,6 +868,28 @@ class LinuxDoBrowser:
 			viewport = self.page.viewport_size or {'width': 1360, 'height': 900}
 			viewport_step = int(viewport['height'] * random.uniform(0.65, 0.95))
 			step = max(step, viewport_step)
+			try:
+				scrolled = await self.page.evaluate(
+					"""step => {
+						const scrollingElement = document.scrollingElement || document.documentElement || document.body;
+						if (!scrollingElement) return false;
+
+						const before = scrollingElement.scrollTop || window.pageYOffset || 0;
+						const target = before + step;
+						window.scrollTo(0, target);
+						scrollingElement.scrollTop = target;
+						window.dispatchEvent(new Event('scroll'));
+						scrollingElement.dispatchEvent(new Event('scroll', { bubbles: true }));
+
+						const after = scrollingElement.scrollTop || window.pageYOffset || 0;
+						return after !== before;
+					}""",
+					step,
+				)
+				if scrolled:
+					return
+			except PlaywrightError:
+				pass
 		viewport = self.page.viewport_size or {'width': 1360, 'height': 900}
 		try:
 			await self.page.mouse.move(
@@ -852,15 +907,84 @@ class LinuxDoBrowser:
 	async def is_at_bottom(self) -> bool:
 		return await self.page.evaluate(
 			"""() => {
-				const top = window.pageYOffset || document.documentElement.scrollTop;
-				const height = document.documentElement.scrollHeight;
-				const client = document.documentElement.clientHeight;
+				const scrollingElement = document.scrollingElement || document.documentElement;
+				const top = window.pageYOffset || scrollingElement.scrollTop;
+				const height = scrollingElement.scrollHeight;
+				const client = scrollingElement.clientHeight;
 				return top + client >= height - 100;
 			}"""
 		)
 
 	async def get_scroll_height(self) -> int:
-		return int(await self.page.evaluate('document.documentElement.scrollHeight'))
+		return int(await self.page.evaluate('(document.scrollingElement || document.documentElement).scrollHeight'))
+
+	async def topic_highest_post_number(self, topic_id: str) -> int | None:
+		raw_highest = await self.page.evaluate(
+			"""async (topicId) => {
+				const parseNumber = value => {
+					const parsed = Number(String(value || '').replace(/,/g, '').trim());
+					return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+				};
+
+				try {
+					const response = await fetch(`/t/topic/${topicId}.json`, {
+						credentials: 'same-origin',
+						headers: {
+							'Accept': 'application/json',
+							'X-Requested-With': 'XMLHttpRequest',
+							'Discourse-Present': 'true',
+						},
+					});
+					if (response.ok) {
+						const data = await response.json();
+						const highest = parseNumber(data.highest_post_number || data.posts_count);
+						if (highest) return highest;
+					}
+				} catch (e) {}
+
+				const numbers = [];
+				for (const element of document.querySelectorAll('[data-post-number]')) {
+					const number = parseNumber(element.getAttribute('data-post-number'));
+					if (number) numbers.push(number);
+				}
+				for (const element of document.querySelectorAll('.topic-progress .total, .timeline-container .total')) {
+					const number = parseNumber(element.textContent);
+					if (number) numbers.push(number);
+				}
+				return numbers.length ? Math.max(...numbers) : null;
+			}""",
+			topic_id,
+		)
+		return parse_positive_int(raw_highest)
+
+	async def loaded_topic_post_numbers(self) -> set[int]:
+		raw_numbers = await self.page.evaluate(
+			"""() => {
+				const numbers = new Set();
+				const addNumber = value => {
+					const parsed = Number(String(value || '').replace(/,/g, '').trim());
+					if (Number.isFinite(parsed) && parsed > 0) numbers.add(parsed);
+				};
+
+				for (const article of document.querySelectorAll('article[id^="post_"]')) {
+					addNumber(article.getAttribute('data-post-number'));
+					const link = article.querySelector('a[href*="/t/"]');
+					const href = link?.getAttribute('href') || '';
+					const match = href.match(/\\/t\\/[^/]+\\/\\d+\\/(\\d+)(?:[?#]|$)/);
+					if (match) addNumber(match[1]);
+				}
+				return Array.from(numbers);
+			}"""
+		)
+		if not isinstance(raw_numbers, list):
+			return set()
+		return {number for value in raw_numbers if (number := parse_positive_int(value)) is not None}
+
+	async def jump_to_topic_post(self, topic_id: str, post_number: int) -> None:
+		self.log(f'滚动未加载更多帖子，跳转到第 {post_number} 楼继续阅读')
+		await self.page.goto(f'{BASE_URL}/t/topic/{topic_id}/{post_number}', wait_until='domcontentloaded')
+		await sleep_range((1200, 1800))
+		self.heartbeat()
 
 	async def loaded_list_topic_ids(self) -> set[str]:
 		raw_ids = await self.page.evaluate(
@@ -1068,6 +1192,7 @@ class LinuxDoBrowser:
 		if self.store is not None and self.account is not None:
 			self.store.upsert_topic_snapshot(self.account.id, topic_id, topic_title, topic_url)
 
+		highest_post_number = await self.topic_highest_post_number(topic_id)
 		if topic_id not in self.state.viewed_topics:
 			if self.daily_topic_limit_reached():
 				self.log('今日话题浏览上限已达，跳过新话题记录')
@@ -1082,10 +1207,12 @@ class LinuxDoBrowser:
 		last_scroll_height = await self.get_scroll_height()
 		no_new_content_count = 0
 		viewed_posts: set[str] = set()
+		viewed_post_numbers = await self.loaded_topic_post_numbers()
 		topic_pages_viewed = 1
 
 		while self.running:
 			self.check_stuck()
+			viewed_count_before = len(viewed_posts)
 			posts = self.page.locator('article[id^="post_"]')
 			count = await posts.count()
 			for index in range(count):
@@ -1109,6 +1236,9 @@ class LinuxDoBrowser:
 					continue
 
 				viewed_posts.add(post_key)
+				post_number = parse_positive_int(await safe_locator_attribute(post, 'data-post-number'))
+				if post_number is not None:
+					viewed_post_numbers.add(post_number)
 				self.state.session_replies += 1
 				self.state.total_replies += 1
 				if self.store is not None and self.account is not None:
@@ -1131,18 +1261,31 @@ class LinuxDoBrowser:
 				read_range = speed['read_ms']
 				if read_range[1] > 0:
 					await sleep_range(tuple(read_range))
+			viewed_post_numbers.update(await self.loaded_topic_post_numbers())
 
 			if await self.is_at_bottom():
 				await sleep_range(tuple(speed['load_wait_ms']))
 				current_height = await self.get_scroll_height()
-				if current_height > last_scroll_height:
+				height_increased = current_height > last_scroll_height
+				saw_new_posts = len(viewed_posts) > viewed_count_before
+				if height_increased or saw_new_posts:
 					last_scroll_height = current_height
 					no_new_content_count = 0
-					self.log('检测到更多帖子加载')
+					if height_increased:
+						self.log('检测到更多帖子加载')
 				else:
 					no_new_content_count += 1
 					self.log(f'无新内容 ({no_new_content_count}/{speed["no_new_content_retry"]})')
 					if no_new_content_count >= speed['no_new_content_retry']:
+						if highest_post_number is None:
+							highest_post_number = await self.topic_highest_post_number(topic_id)
+						next_post_number = next_topic_post_number(viewed_post_numbers, highest_post_number)
+						if next_post_number is not None and topic_pages_viewed < self.config.max_topic_pages:
+							await self.jump_to_topic_post(topic_id, next_post_number)
+							last_scroll_height = await self.get_scroll_height()
+							no_new_content_count = 0
+							topic_pages_viewed += 1
+							continue
 						self.log('话题浏览完成')
 						break
 			else:
@@ -1586,15 +1729,36 @@ async def review_like_candidates(browser: LinuxDoBrowser, store: AccountStore, a
 			await resample_like_candidates(browser, like_review_target_remaining(browser.config, browser))
 
 
-def topic_payloads_for_llm(store: AccountStore, account: Account) -> list[dict[str, str]]:
+def llm_candidate_topics_for_account(store: AccountStore, account: Account, local_day=None) -> list[dict[str, str]]:
+	processed_topic_ids = store.topic_ids_for_events(account.id, LLM_PROCESSED_EVENT_TYPES, local_day)
 	return [
 		{
 			'topic_id': topic.topic_id,
 			'title': topic.title,
 			'url': topic.url,
 		}
-		for topic in store.topic_snapshots_for_day(account.id)
+		for topic in store.topic_snapshots_for_day(account.id, local_day)
+		if topic.topic_id not in processed_topic_ids
 	]
+
+
+def topic_payloads_for_llm(store: AccountStore, account: Account) -> list[dict[str, str]]:
+	return llm_candidate_topics_for_account(store, account)
+
+
+def llm_candidate_counts(store: AccountStore, accounts: list[Account]) -> dict[int, int]:
+	return {account.id: len(llm_candidate_topics_for_account(store, account)) for account in accounts}
+
+
+def llm_progress() -> Progress:
+	return Progress(
+		SpinnerColumn(),
+		TextColumn('[progress.description]{task.description}'),
+		BarColumn(),
+		MofNCompleteColumn(),
+		TimeElapsedColumn(),
+		console=console,
+	)
 
 
 def post_payloads_for_llm(store: AccountStore, account: Account, topic_id: str) -> list[dict[str, str]]:
@@ -1607,6 +1771,123 @@ def post_payloads_for_llm(store: AccountStore, account: Account, topic_id: str) 
 		}
 		for post in posts
 	]
+
+
+def read_terminal_key(fd: int, decoder: codecs.IncrementalDecoder) -> str:
+	while True:
+		chunk = os.read(fd, 1)
+		if not chunk:
+			raise EOFError
+		if chunk in {b'\r', b'\n'}:
+			return 'enter'
+		if chunk == b'\x03':
+			raise KeyboardInterrupt
+		if chunk == b'\x04':
+			return 'eof'
+		if chunk in {b'\x7f', b'\b'}:
+			return 'backspace'
+		if chunk == b'\x01':
+			return 'home'
+		if chunk == b'\x05':
+			return 'end'
+		if chunk == b'\x15':
+			return 'clear'
+		if chunk == b'\x1b':
+			sequence = bytearray(chunk)
+			while len(sequence) < 8 and select_module.select([fd], [], [], 0.02)[0]:
+				sequence.extend(os.read(fd, 1))
+				if sequence.endswith(b'~') or bytes(sequence) in {
+					b'\x1b[D',
+					b'\x1b[C',
+					b'\x1b[H',
+					b'\x1b[F',
+					b'\x1bOD',
+					b'\x1bOC',
+					b'\x1bOH',
+					b'\x1bOF',
+				}:
+					break
+			sequence_bytes = bytes(sequence)
+			return {
+				b'\x1b[D': 'left',
+				b'\x1bOD': 'left',
+				b'\x1b[C': 'right',
+				b'\x1bOC': 'right',
+				b'\x1b[H': 'home',
+				b'\x1bOH': 'home',
+				b'\x1b[1~': 'home',
+				b'\x1b[7~': 'home',
+				b'\x1b[F': 'end',
+				b'\x1bOF': 'end',
+				b'\x1b[4~': 'end',
+				b'\x1b[8~': 'end',
+				b'\x1b[3~': 'delete',
+			}.get(sequence_bytes, 'ignore')
+		text = decoder.decode(chunk)
+		if text:
+			return text
+
+
+def prompt_editable_text(label: str, default: str) -> str:
+	if termios is None or tty is None or not sys.stdin.isatty() or not sys.stdout.isatty():
+		return Prompt.ask(label, default=default).strip()
+
+	fd = sys.stdin.fileno()
+	old_settings = termios.tcgetattr(fd)
+	prompt = f'{label}: '
+	buffer = list(default)
+	cursor = len(buffer)
+
+	def redraw() -> None:
+		text = ''.join(buffer)
+		before_cursor = ''.join(buffer[:cursor])
+		cursor_column = cell_len(prompt + before_cursor)
+		sys.stdout.write('\r\x1b[2K' + prompt + text)
+		sys.stdout.write('\r')
+		if cursor_column:
+			sys.stdout.write(f'\x1b[{cursor_column}C')
+		sys.stdout.flush()
+
+	try:
+		tty.setraw(fd)
+		redraw()
+		decoder = codecs.getincrementaldecoder('utf-8')('ignore')
+		while True:
+			key = read_terminal_key(fd, decoder)
+			if key == 'enter':
+				sys.stdout.write('\n')
+				sys.stdout.flush()
+				return ''.join(buffer).strip()
+			if key == 'eof':
+				sys.stdout.write('\n')
+				sys.stdout.flush()
+				return ''.join(buffer).strip()
+			if key == 'left':
+				cursor = max(0, cursor - 1)
+			elif key == 'right':
+				cursor = min(len(buffer), cursor + 1)
+			elif key == 'home':
+				cursor = 0
+			elif key == 'end':
+				cursor = len(buffer)
+			elif key == 'backspace':
+				if cursor > 0:
+					del buffer[cursor - 1]
+					cursor -= 1
+			elif key == 'delete':
+				if cursor < len(buffer):
+					del buffer[cursor]
+			elif key == 'clear':
+				buffer.clear()
+				cursor = 0
+			elif key != 'ignore':
+				for char in key:
+					if char.isprintable():
+						buffer.insert(cursor, char)
+						cursor += 1
+			redraw()
+	finally:
+		termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 def review_reply_text(topic: dict[str, str], reply: str) -> str | None:
@@ -1624,7 +1905,7 @@ def review_reply_text(topic: dict[str, str], reply: str) -> str | None:
 	if choice == 'n':
 		return None
 	if choice == 'e':
-		edited = Prompt.ask('编辑回复', default=reply).strip()
+		edited = prompt_editable_text('编辑回复', reply)
 		return edited or None
 	return reply
 
@@ -1751,11 +2032,15 @@ async def cmd_llm_reply(args: argparse.Namespace) -> int:
 	account = resolve_account(store, getattr(args, 'account', None))
 	topics = topic_payloads_for_llm(store, account)
 	if not topics:
-		console.print('[yellow]今天还没有可用于 LLM 评论的话题快照，请先运行浏览流程[/]')
+		console.print('[yellow]今天还没有可用于 LLM 评论的话题快照，或今天的话题都已被 LLM 处理过[/]')
 		return 1
 
+	console.print(f'[dim]今日未处理 LLM 候选话题: {len(topics)}；本次筛选: {min(reply_count, len(topics))}[/]')
 	try:
-		selected_topic_ids = select_llm_topic_ids(config, topics, reply_count)
+		with llm_progress() as progress:
+			task = progress.add_task(f'LLM 正在筛选 {len(topics)} 个候选话题', total=None)
+			selected_topic_ids = await asyncio.to_thread(select_llm_topic_ids, config, topics, reply_count)
+			progress.update(task, description='LLM 话题筛选完成', total=1, completed=1)
 	except Exception as exc:
 		error_console.print(f'[bold red]LLM 话题筛选失败:[/] {exc}')
 		return 1
@@ -1765,15 +2050,32 @@ async def cmd_llm_reply(args: argparse.Namespace) -> int:
 		return 1
 
 	topics_by_id = {topic['topic_id']: topic for topic in topics}
-	approved_replies: list[tuple[dict[str, str], str]] = []
-	for topic_id in selected_topic_ids:
-		topic = topics_by_id[topic_id]
-		posts = post_payloads_for_llm(store, account, topic_id)
-		try:
-			reply = generate_llm_reply(config, topic, posts)
-		except Exception as exc:
+	generated_replies: list[tuple[dict[str, str], str]] = []
+	generation_errors: list[tuple[str, Exception]] = []
+	with llm_progress() as progress:
+		task = progress.add_task('生成 LLM 回复候选', total=len(selected_topic_ids))
+		for index, topic_id in enumerate(selected_topic_ids, start=1):
+			topic = topics_by_id[topic_id]
+			posts = post_payloads_for_llm(store, account, topic_id)
+			progress.update(task, description=f'生成回复 {index}/{len(selected_topic_ids)}: {topic["title"][:28]}')
+			try:
+				reply = await asyncio.to_thread(generate_llm_reply, config, topic, posts)
+			except Exception as exc:
+				generation_errors.append((topic_id, exc))
+			else:
+				store.record_event(account.id, 'llm_processed', topic_id=topic_id)
+				generated_replies.append((topic, reply))
+			finally:
+				progress.advance(task)
+	if generation_errors:
+		for topic_id, exc in generation_errors:
 			console.print(f'[yellow]生成话题 {topic_id} 回复失败:[/] {exc}')
-			continue
+	if not generated_replies:
+		console.print('[dim]没有生成可审核的回复[/]')
+		return 0
+
+	approved_replies: list[tuple[dict[str, str], str]] = []
+	for topic, reply in generated_replies:
 		try:
 			final_reply = review_reply_text(topic, reply)
 		except KeyboardInterrupt:
@@ -1788,17 +2090,22 @@ async def cmd_llm_reply(args: argparse.Namespace) -> int:
 	browser = build_browser_for_account(config, store, account)
 	async with async_playwright() as playwright:
 		try:
-			await browser.launch(playwright)
-			await browser.ensure_logged_in()
-			for topic, reply in approved_replies:
-				await browser.page.goto(topic['url'] or f'{BASE_URL}/t/topic/{topic["topic_id"]}/1', wait_until='domcontentloaded')
-				await browser.handle_human_verification()
-				result = await browser.send_reply(topic['topic_id'], reply)
-				if result.get('success'):
-					store.record_event(account.id, 'llm_reply', topic_id=topic['topic_id'], post_id=result.get('post_id'))
-					console.print(f'[green]已发布回复:[/] {topic["title"]}')
-				else:
-					console.print(f'[yellow]回复失败 {topic["topic_id"]}:[/] {result.get("error")}')
+			with llm_progress() as progress:
+				task = progress.add_task('启动浏览器并发布回复', total=len(approved_replies) + 1)
+				await browser.launch(playwright)
+				await browser.ensure_logged_in()
+				progress.advance(task)
+				for topic, reply in approved_replies:
+					progress.update(task, description=f'发布回复: {topic["title"][:32]}')
+					await browser.page.goto(topic['url'] or f'{BASE_URL}/t/topic/{topic["topic_id"]}/1', wait_until='domcontentloaded')
+					await browser.handle_human_verification()
+					result = await browser.send_reply(topic['topic_id'], reply)
+					if result.get('success'):
+						store.record_event(account.id, 'llm_reply', topic_id=topic['topic_id'], post_id=result.get('post_id'))
+						progress.console.print(f'[green]已发布回复:[/] {topic["title"]}')
+					else:
+						progress.console.print(f'[yellow]回复失败 {topic["topic_id"]}:[/] {result.get("error")}')
+					progress.advance(task)
 		finally:
 			await browser.close()
 	cmd_status_for_account(store, account)
@@ -2184,11 +2491,13 @@ def tui_select_account(
 	title: str = '选择账号',
 	allow_cancel: bool = True,
 	show_run_status: bool = False,
+	show_llm_candidates: bool = False,
 ) -> str | None:
 	accounts = store.list_accounts()
 	if not accounts:
 		accounts = [store.get_or_create_default_account()]
 	run_statuses = account_run_statuses(store, accounts) if show_run_status else {}
+	llm_counts = llm_candidate_counts(store, accounts) if show_llm_candidates else {}
 
 	table = Table(title=title, header_style='bold cyan')
 	table.add_column('选择', justify='center', no_wrap=True)
@@ -2196,6 +2505,8 @@ def tui_select_account(
 	table.add_column('Slug')
 	table.add_column('用户名')
 	table.add_column('目标等级', justify='right')
+	if show_llm_candidates:
+		table.add_column('LLM候选', justify='right')
 	if show_run_status:
 		table.add_column('今日执行', justify='center')
 		table.add_column('上次执行', no_wrap=True)
@@ -2207,12 +2518,16 @@ def tui_select_account(
 			account.username or '-',
 			str(account.target_level),
 		]
+		if show_llm_candidates:
+			row.append(str(llm_counts.get(account.id, 0)))
 		if show_run_status:
 			has_run_today, last_run = run_statuses[account.id]
 			row.extend([Text('🟢') if has_run_today else Text('', style='dim'), last_run])
 		table.add_row(*row)
 	if allow_cancel:
 		row = ['0', '返回', '-', '-', '-']
+		if show_llm_candidates:
+			row.append('-')
 		if show_run_status:
 			row.extend(['-', '-'])
 		table.add_row(*row)
@@ -2379,7 +2694,7 @@ async def tui_browse_menu() -> None:
 				tui_pause()
 		elif choice == '6':
 			store = get_store()
-			account = tui_select_account(store)
+			account = tui_select_account(store, show_llm_candidates=True)
 			if account is not None:
 				config = load_config()
 				count = tui_prompt_int('筛选话题数 N', config.llm_topic_count, 1)
@@ -2553,6 +2868,8 @@ def main() -> int:
 	return asyncio.run(async_main(args))
 
 
+if __name__ == '__main__':
+	raise SystemExit(main())
 if __name__ == '__main__':
 	raise SystemExit(main())
 if __name__ == '__main__':

@@ -100,6 +100,19 @@ def test_daily_event_counts_use_local_day(tmp_path):
 	assert counts == {'topic_view': 1, 'like_given': 1}
 
 
+def test_topic_ids_for_events_uses_local_day(tmp_path):
+	store = make_store(tmp_path)
+	account = store.add_account('main')
+	now = datetime.now().astimezone()
+
+	store.record_event(account.id, 'llm_processed', topic_id='101', created_at=now)
+	store.record_event(account.id, 'llm_processed', topic_id='102', created_at=now - timedelta(days=1))
+	store.record_event(account.id, 'manual_reply', topic_id='103', created_at=now)
+
+	assert store.topic_ids_for_events(account.id, {'llm_processed'}, now.date()) == {'101'}
+	assert store.topic_ids_for_events(account.id, {'llm_processed', 'manual_reply'}, now.date()) == {'101', '103'}
+
+
 def test_topic_and_post_snapshots_feed_like_candidates(tmp_path):
 	store = make_store(tmp_path)
 	account = store.add_account('main')

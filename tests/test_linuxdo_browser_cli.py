@@ -7,11 +7,14 @@ from scripts.linuxdo.linuxdo_browser import (
 	LinuxDoBrowser,
 	build_parser,
 	extract_json_payload,
+	llm_candidate_topics_for_account,
+	next_topic_post_number,
 	normalize_openai_base_url,
 	sync_status_for_account,
 	topic_list_has_new_content,
 	tui_args,
 )
+from scripts.linuxdo.linuxdo_store import AccountStore
 
 
 def test_legacy_entrypoint_module_exports_main():
@@ -130,6 +133,27 @@ def test_topic_list_detects_new_ids_without_height_change():
 	assert topic_list_has_new_content({'101', '102'}, {'101', '102'}, 3000, 3000) is False
 
 
+def test_next_topic_post_number_stops_at_highest_post():
+	assert next_topic_post_number({1, 2, 3}, 5) == 4
+	assert next_topic_post_number({1, 2, 3}, 3) is None
+	assert next_topic_post_number(set(), 5) is None
+	assert next_topic_post_number({1}, None) is None
+
+
+def test_llm_candidate_topics_exclude_processed_today(tmp_path):
+	store = AccountStore(tmp_path / 'linuxdo.sqlite3', tmp_path / 'profiles')
+	store.init_db()
+	account = store.add_account('main')
+
+	store.record_event(account.id, 'topic_view', topic_id='101')
+	store.record_event(account.id, 'topic_view', topic_id='102')
+	store.upsert_topic_snapshot(account.id, '101', 'Processed topic', 'https://linux.do/t/topic/101/1')
+	store.upsert_topic_snapshot(account.id, '102', 'Fresh topic', 'https://linux.do/t/topic/102/1')
+	store.record_event(account.id, 'llm_processed', topic_id='101')
+
+	assert [topic['topic_id'] for topic in llm_candidate_topics_for_account(store, account)] == ['102']
+
+
 @pytest.mark.asyncio
 async def test_scroll_down_uses_mouse_wheel():
 	class FakeMouse:
@@ -162,6 +186,39 @@ async def test_scroll_down_uses_mouse_wheel():
 	assert page.mouse.wheels
 	assert page.mouse.wheels[0][0] == 0
 	assert page.mouse.wheels[0][1] > 0
+
+
+@pytest.mark.asyncio
+async def test_page_scroll_uses_programmatic_scroll_before_wheel():
+	class FakeMouse:
+		def __init__(self):
+			self.wheels = []
+
+		async def move(self, *_args):
+			raise AssertionError('page_scroll should use JS scroll before mouse movement')
+
+		async def wheel(self, delta_x, delta_y):
+			self.wheels.append((delta_x, delta_y))
+
+	class FakePage:
+		viewport_size = {'width': 1000, 'height': 800}
+
+		def __init__(self):
+			self.mouse = FakeMouse()
+			self.evaluations = []
+
+		async def evaluate(self, script, step):
+			self.evaluations.append((script, step))
+			return True
+
+	page = FakePage()
+	browser = LinuxDoBrowser(BrowserConfig(), BrowserState())
+	browser._page = page
+
+	await browser.scroll_down({'scroll_step': 400}, page_scroll=True)
+
+	assert page.evaluations
+	assert not page.mouse.wheels
 
 
 def test_browser_config_validates_target_level():

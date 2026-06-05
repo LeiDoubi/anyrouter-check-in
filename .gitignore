@@ -12,3 +12,5 @@ balance_hash.txt
 .DS_Store
 accounts
 data
+.playwright-mcp/*.log
+coverage.xml

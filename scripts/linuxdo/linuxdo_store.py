@@ -19,6 +19,10 @@ def slugify_account_name(name: str) -> str:
 	return slug or 'account'
 
 
+def local_date_from_datetime(value: datetime):
+	return value.date() if value.tzinfo is None else value.astimezone().date()
+
+
 class Base(DeclarativeBase):
 	pass
 
@@ -312,6 +316,31 @@ class AccountStore:
 			)
 			return {event.topic_id for event in events if event.topic_id}
 
+	def topic_ids_for_events(
+		self,
+		account_id: int,
+		event_types: set[str],
+		local_day=None,
+	) -> set[str]:
+		target_day = local_day or datetime.now().astimezone().date()
+		if not event_types:
+			return set()
+		with self.session() as session:
+			events = list(
+				session.scalars(
+					select(ActivityEvent).where(
+						ActivityEvent.account_id == account_id,
+						ActivityEvent.event_type.in_(event_types),
+						ActivityEvent.topic_id.is_not(None),
+					)
+				).all()
+			)
+		return {
+			event.topic_id
+			for event in events
+			if event.topic_id and local_date_from_datetime(event.created_at) == target_day
+		}
+
 	def record_connect_snapshot(self, account_id: int, payload: dict[str, Any]) -> ConnectSnapshot:
 		with self.session() as session:
 			snapshot = ConnectSnapshot(
@@ -428,8 +457,7 @@ class AccountStore:
 			ordered_topic_ids: list[str] = []
 			seen: set[str] = set()
 			for event in events:
-				event_date = event.created_at.date() if event.created_at.tzinfo is None else event.created_at.astimezone().date()
-				if event_date != target_day or not event.topic_id or event.topic_id in seen:
+				if local_date_from_datetime(event.created_at) != target_day or not event.topic_id or event.topic_id in seen:
 					continue
 				ordered_topic_ids.append(event.topic_id)
 				seen.add(event.topic_id)
@@ -494,9 +522,7 @@ class AccountStore:
 		topic_ids: set[str] = set()
 		likes = 0
 		for event in events:
-			event_day = event.created_at
-			event_date = event_day.date() if event_day.tzinfo is None else event_day.astimezone().date()
-			if event_date != target_day:
+			if local_date_from_datetime(event.created_at) != target_day:
 				continue
 			if event.event_type == 'topic_view' and event.topic_id:
 				topic_ids.add(event.topic_id)
