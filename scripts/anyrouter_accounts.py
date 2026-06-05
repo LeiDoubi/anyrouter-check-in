@@ -47,6 +47,8 @@ DEFAULT_ACCOUNTS_FILE_NAME = '.accounts.json'
 CONFIG_ACCOUNTS_FILE = STATE_DIR / 'accounts.json'
 ACTIVE_STATE_FILE = STATE_DIR / 'active.json'
 ENV_EXPORT_FILE = STATE_DIR / 'env.sh'
+CLAUDE_DIR = Path.home() / '.claude'
+CLAUDE_SETTINGS_FILE = CLAUDE_DIR / 'settings.json'
 CODEX_DIR = Path.home() / '.codex'
 CODEX_AUTH_FILE = CODEX_DIR / 'auth.json'
 CODEX_CONFIG_FILE = CODEX_DIR / 'config.toml'
@@ -55,6 +57,8 @@ DEFAULT_BASE_URL = 'https://anyrouter.top'
 CODEX_CONFIG_TEMPLATE = """model = "gpt-5-codex"
 model_provider = "anyrouter"
 preferred_auth_method = "apikey"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
 
 [model_providers.anyrouter]
 name = "Any Router"
@@ -80,6 +84,8 @@ CODEX_PROVIDER={codex_provider}
 STATE_DIR="${{HOME}}/.config/anyrouter-check-in"
 ENV_FILE="${{STATE_DIR}}/env.sh"
 ACTIVE_FILE="${{STATE_DIR}}/active.json"
+CLAUDE_DIR="${{HOME}}/.claude"
+CLAUDE_SETTINGS_FILE="${{CLAUDE_DIR}}/settings.json"
 CODEX_DIR="${{HOME}}/.codex"
 CODEX_AUTH_FILE="${{CODEX_DIR}}/auth.json"
 CODEX_CONFIG_FILE="${{CODEX_DIR}}/config.toml"
@@ -117,6 +123,8 @@ ensure_shell_hook() {{
     skip == 1 {{ next }}
     /^[[:space:]]*export[[:space:]]+ANTHROPIC_AUTH_TOKEN=/ {{ next }}
     /^[[:space:]]*export[[:space:]]+ANTHROPIC_BASE_URL=/ {{ next }}
+    /^[[:space:]]*export[[:space:]]+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=/ {{ next }}
+    /^[[:space:]]*export[[:space:]]+CLAUDE_CODE_ATTRIBUTION_HEADER=/ {{ next }}
     {{ print }}
   ' "$rc_file" > "$tmp_file"
 
@@ -144,6 +152,8 @@ write_codex_config() {{
 model = "${{CODEX_MODEL}}"
 model_provider = "${{CODEX_PROVIDER}}"
 preferred_auth_method = "apikey"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
 
 [model_providers.anyrouter]
 name = "Any Router"
@@ -158,18 +168,35 @@ EOF
       wrote_model = 0
       wrote_provider = 0
       wrote_auth = 0
+      wrote_approval = 0
+      wrote_sandbox = 0
+      emitted_root = 0
+      seen_section = 0
+    }}
+    function emit_missing_root() {{
+      if (emitted_root) return
+      if (!wrote_model) print "model = \"" model "\""
+      if (!wrote_provider) print "model_provider = \"" provider "\""
+      if (!wrote_auth) print "preferred_auth_method = \"apikey\""
+      if (!wrote_approval) print "approval_policy = \"never\""
+      if (!wrote_sandbox) print "sandbox_mode = \"danger-full-access\""
+      emitted_root = 1
     }}
     /^\[model_providers\.anyrouter\]$/ {{ skip_anyrouter = 1; next }}
     /^\[/ && skip_anyrouter == 1 {{ skip_anyrouter = 0 }}
     skip_anyrouter == 1 {{ next }}
-    /^model[[:space:]]*=/ {{ print "model = \"" model "\""; wrote_model = 1; next }}
-    /^model_provider[[:space:]]*=/ {{ print "model_provider = \"" provider "\""; wrote_provider = 1; next }}
-    /^preferred_auth_method[[:space:]]*=/ {{ print "preferred_auth_method = \"apikey\""; wrote_auth = 1; next }}
+    /^\[/ {{
+      if (!seen_section) emit_missing_root()
+      seen_section = 1
+    }}
+    !seen_section && /^model[[:space:]]*=/ {{ print "model = \"" model "\""; wrote_model = 1; next }}
+    !seen_section && /^model_provider[[:space:]]*=/ {{ print "model_provider = \"" provider "\""; wrote_provider = 1; next }}
+    !seen_section && /^preferred_auth_method[[:space:]]*=/ {{ print "preferred_auth_method = \"apikey\""; wrote_auth = 1; next }}
+    !seen_section && /^approval_policy[[:space:]]*=/ {{ print "approval_policy = \"never\""; wrote_approval = 1; next }}
+    !seen_section && /^sandbox_mode[[:space:]]*=/ {{ print "sandbox_mode = \"danger-full-access\""; wrote_sandbox = 1; next }}
     {{ print }}
     END {{
-      if (!wrote_model) print "model = \"" model "\""
-      if (!wrote_provider) print "model_provider = \"" provider "\""
-      if (!wrote_auth) print "preferred_auth_method = \"apikey\""
+      if (!seen_section) emit_missing_root()
       print ""
       print "[model_providers.anyrouter]"
       print "name = \"Any Router\""
@@ -180,14 +207,54 @@ EOF
   mv "${{CODEX_CONFIG_FILE}}.new" "$CODEX_CONFIG_FILE"
 }}
 
+write_claude_settings() {{
+  local python_bin
+
+  mkdir -p "$CLAUDE_DIR"
+  if [[ -f "$CLAUDE_SETTINGS_FILE" ]]; then
+    backup_file "$CLAUDE_SETTINGS_FILE"
+  fi
+
+  python_bin="$(command -v python3 || command -v python || true)"
+  if [[ -z "$python_bin" ]]; then
+    printf 'ERROR: python3 or python is required to update %s\n' "$CLAUDE_SETTINGS_FILE" >&2
+    return 1
+  fi
+
+  "$python_bin" - "$CLAUDE_SETTINGS_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {{}}
+except json.JSONDecodeError:
+    data = {{}}
+
+if not isinstance(data, dict):
+    data = {{}}
+
+permissions = data.get('permissions')
+if not isinstance(permissions, dict):
+    permissions = {{}}
+
+permissions['defaultMode'] = 'bypassPermissions'
+data['permissions'] = permissions
+path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+PY
+}}
+
 main() {{
-  mkdir -p "$STATE_DIR" "$CODEX_DIR"
+  mkdir -p "$STATE_DIR" "$CLAUDE_DIR" "$CODEX_DIR"
 
   backup_file "$ENV_FILE"
   cat > "$ENV_FILE" <<EOF
 # Active account: ${{ACTIVE_ACCOUNT_NAME}}
 export ANTHROPIC_AUTH_TOKEN="${{ANYROUTER_AUTH_TOKEN}}"
 export ANTHROPIC_BASE_URL="${{ANYROUTER_BASE_URL}}"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 EOF
 
   backup_file "$ACTIVE_FILE"
@@ -204,8 +271,9 @@ EOF
   "OPENAI_API_KEY": "${{ANYROUTER_AUTH_TOKEN}}"
 }}
 EOF
-  chmod 600 "$CODEX_AUTH_FILE" "$ENV_FILE" "$ACTIVE_FILE" 2>/dev/null || true
 
+  write_claude_settings
+  chmod 600 "$CODEX_AUTH_FILE" "$ENV_FILE" "$ACTIVE_FILE" "$CLAUDE_SETTINGS_FILE" 2>/dev/null || true
   write_codex_config
   ensure_shell_hook "${{HOME}}/.zshrc"
   ensure_shell_hook "${{HOME}}/.bashrc"
@@ -213,6 +281,7 @@ EOF
   printf '\nAnyRouter deploy complete.\n'
   printf 'Active account: %s\n' "$ACTIVE_ACCOUNT_NAME"
   printf 'Claude Code env: %s\n' "$ENV_FILE"
+  printf 'Claude Code settings: %s\n' "$CLAUDE_SETTINGS_FILE"
   printf 'Codex auth: %s\n' "$CODEX_AUTH_FILE"
   printf 'Codex config: %s\n' "$CODEX_CONFIG_FILE"
   printf '\nRun this in the current shell to apply immediately:\n'
@@ -650,9 +719,46 @@ def ensure_codex_config(base_url: str) -> None:
 		return
 
 	content = CODEX_CONFIG_FILE.read_text(encoding='utf-8')
-	updated = re.sub(r'base_url\s*=\s*"[^"]*"', f'base_url = "{v1_url}"', content, count=1)
+	updated = upsert_toml_root_string(content, 'approval_policy', 'never')
+	updated = upsert_toml_root_string(updated, 'sandbox_mode', 'danger-full-access')
+	updated = re.sub(r'base_url\s*=\s*"[^"]*"', f'base_url = "{v1_url}"', updated, count=1)
 	if updated != content:
 		CODEX_CONFIG_FILE.write_text(updated, encoding='utf-8')
+
+
+def upsert_toml_root_string(content: str, key: str, value: str) -> str:
+	line = f'{key} = "{value}"'
+	pattern = rf'^{re.escape(key)}\s*=\s*"[^"]*"'
+	if re.search(pattern, content, re.MULTILINE):
+		return re.sub(pattern, line, content, count=1, flags=re.MULTILINE)
+
+	section_match = re.search(r'^\[', content, re.MULTILINE)
+	insert = f'{line}\n'
+	if section_match:
+		return content[: section_match.start()] + insert + content[section_match.start() :]
+	trailing_newline = '' if content.endswith('\n') or not content else '\n'
+	return f'{content}{trailing_newline}{insert}'
+
+
+def ensure_claude_settings() -> None:
+	CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+	data: Any = {}
+	if CLAUDE_SETTINGS_FILE.is_file():
+		try:
+			data = json.loads(CLAUDE_SETTINGS_FILE.read_text(encoding='utf-8'))
+		except json.JSONDecodeError:
+			data = {}
+
+	if not isinstance(data, dict):
+		data = {}
+
+	permissions = data.get('permissions')
+	if not isinstance(permissions, dict):
+		permissions = {}
+
+	permissions['defaultMode'] = 'bypassPermissions'
+	data['permissions'] = permissions
+	CLAUDE_SETTINGS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
 
 
 def read_codex_string_setting(key: str, default: str) -> str:
@@ -686,7 +792,7 @@ def write_deploy_script(account: dict[str, Any], index: int, base_url: str, name
 
 
 def sync_zshrc_hook() -> list[str]:
-	"""Ensure ~/.zshrc sources env.sh and remove conflicting ANTHROPIC exports."""
+	"""Ensure ~/.zshrc sources env.sh and remove conflicting Claude exports."""
 	actions: list[str] = []
 	lines: list[str] = []
 	if ZSHRC_FILE.is_file():
@@ -710,7 +816,12 @@ def sync_zshrc_hook() -> list[str]:
 		if stripped.startswith('export =export'):
 			actions.append(f'removed broken export: {stripped}')
 			continue
-		if stripped.startswith('export ANTHROPIC_AUTH_TOKEN=') or stripped.startswith('export ANTHROPIC_BASE_URL='):
+		if (
+			stripped.startswith('export ANTHROPIC_AUTH_TOKEN=')
+			or stripped.startswith('export ANTHROPIC_BASE_URL=')
+			or stripped.startswith('export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=')
+			or stripped.startswith('export CLAUDE_CODE_ATTRIBUTION_HEADER=')
+		):
 			actions.append(f'removed conflicting export: {stripped}')
 			continue
 
@@ -745,9 +856,12 @@ def apply_account(account: dict[str, Any], index: int, app_config: AppConfig) ->
 		f'# Active account: {name}\n'
 		f'export ANTHROPIC_AUTH_TOKEN="{auth_token}"\n'
 		f'export ANTHROPIC_BASE_URL="{base_url}"\n'
+		'export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\n'
+		'export CLAUDE_CODE_ATTRIBUTION_HEADER=0\n'
 	)
 	ENV_EXPORT_FILE.write_text(env_content, encoding='utf-8')
 
+	ensure_claude_settings()
 	ensure_codex_config(base_url)
 	CODEX_AUTH_FILE.write_text(json.dumps({'OPENAI_API_KEY': auth_token}, indent=2) + '\n', encoding='utf-8')
 	save_active_state(index, name)
@@ -759,11 +873,12 @@ def apply_account(account: dict[str, Any], index: int, app_config: AppConfig) ->
 def render_apply_result(name: str, deploy_script: Path, zshrc_actions: list[str] | None = None) -> None:
 	zshrc_note = ''
 	if zshrc_actions:
-		zshrc_note = '\n[dim]~/.zshrc[/] 已同步（source env.sh，已清理冲突的 ANTHROPIC 变量）\n'
+		zshrc_note = '\n[dim]~/.zshrc[/] 已同步（source env.sh，已清理冲突的 Claude 变量）\n'
 
 	body = (
 		f'[bold green]✓[/] 已切换至 [bold white]{name}[/]\n\n'
 		f'[dim]Claude Code[/]  [cyan]{ENV_EXPORT_FILE}[/]\n'
+		f'[dim]Claude perm[/]  [cyan]{CLAUDE_SETTINGS_FILE}[/]\n'
 		f'[dim]Codex[/]         [cyan]{CODEX_AUTH_FILE}[/]\n'
 		f'[dim]Deploy[/]        [cyan]{deploy_script}[/]\n'
 		f'{zshrc_note}\n'
@@ -778,6 +893,7 @@ def print_apply_result_plain(name: str, deploy_script: Path, zshrc_actions: list
 	print()
 	print(f'已切换至: {name}')
 	print(f'已更新: {ENV_EXPORT_FILE}')
+	print(f'已更新: {CLAUDE_SETTINGS_FILE}')
 	print(f'已更新: {CODEX_AUTH_FILE}')
 	print(f'已生成 deploy: {deploy_script}')
 	if zshrc_actions:
@@ -856,6 +972,8 @@ def cmd_env(accounts: list[dict[str, Any]]) -> int:
 	base_url = resolve_base_url(account.get('provider', 'anyrouter'), app_config)
 	print(f'export ANTHROPIC_AUTH_TOKEN="{auth_token}"')
 	print(f'export ANTHROPIC_BASE_URL="{base_url}"')
+	print('export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1')
+	print('export CLAUDE_CODE_ATTRIBUTION_HEADER=0')
 	return 0
 
 

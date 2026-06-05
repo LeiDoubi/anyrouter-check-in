@@ -119,15 +119,20 @@ def test_topic_and_post_snapshots_feed_like_candidates(tmp_path):
 	now = datetime.now().astimezone()
 
 	store.record_event(account.id, 'topic_view', topic_id='101', created_at=now)
+	store.record_event(account.id, 'topic_view', topic_id='102', created_at=now)
 	store.upsert_topic_snapshot(account.id, '101', 'Useful topic', 'https://linux.do/t/topic/101/1')
+	store.upsert_topic_snapshot(account.id, '102', 'Fresh topic', 'https://linux.do/t/topic/102/1')
 	store.upsert_post_snapshot(account.id, '101', 'p1', 'short text', author='a')
 	store.upsert_post_snapshot(account.id, '101', 'p2', 'this is a much longer and more useful post', author='b')
 	store.upsert_post_snapshot(account.id, '101', 'p3', 'medium useful post text', author='c')
+	store.upsert_post_snapshot(account.id, '102', 'p4', 'another candidate post', author='d')
+	store.upsert_post_snapshot(account.id, '102', 'p5', 'the strongest candidate from another topic', author='e')
 	store.record_event(account.id, 'like_given', topic_id='101', post_id='p2', created_at=now)
 
 	topics = store.topic_snapshots_for_day(account.id, now.date())
 	candidates = store.like_candidate_posts_for_day(account.id, now.date(), limit_per_topic=2)
 
-	assert [topic.topic_id for topic in topics] == ['101']
-	assert [candidate['post_id'] for candidate in candidates] == ['p3', 'p1']
-	assert candidates[0]['topic_title'] == 'Useful topic'
+	assert [topic.topic_id for topic in topics] == ['101', '102']
+	assert store.liked_topics(account.id) == {'101'}
+	assert [candidate['post_id'] for candidate in candidates] == ['p5', 'p4']
+	assert candidates[0]['topic_title'] == 'Fresh topic'

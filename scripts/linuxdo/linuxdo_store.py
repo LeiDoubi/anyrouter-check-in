@@ -375,6 +375,28 @@ class AccountStore:
 				)
 			return {event.post_id for event in events if event.post_id}
 
+	def liked_topics(self, account_id: int) -> set[str]:
+		with self.session() as session:
+			events = list(
+				session.scalars(
+					select(ActivityEvent).where(
+						ActivityEvent.account_id == account_id,
+						ActivityEvent.event_type == 'like_given',
+					)
+				).all()
+			)
+			topic_ids = {event.topic_id for event in events if event.topic_id}
+			post_ids = {event.post_id for event in events if event.post_id and not event.topic_id}
+			if post_ids:
+				snapshots = session.scalars(
+					select(PostSnapshot).where(
+						PostSnapshot.account_id == account_id,
+						PostSnapshot.post_id.in_(post_ids),
+					)
+				)
+				topic_ids.update(snapshot.topic_id for snapshot in snapshots if snapshot.topic_id)
+			return topic_ids
+
 	def upsert_topic_snapshot(self, account_id: int, topic_id: str, title: str, url: str) -> None:
 		now = datetime.now().astimezone()
 		with self.session() as session:
@@ -490,14 +512,18 @@ class AccountStore:
 		local_day=None,
 		limit_per_topic: int = 2,
 		exclude_post_ids: set[str] | None = None,
+		exclude_topic_ids: set[str] | None = None,
 	) -> list[dict[str, Any]]:
-		excluded = set(exclude_post_ids or set()) | self.liked_posts(account_id)
+		excluded_post_ids = set(exclude_post_ids or set()) | self.liked_posts(account_id)
+		excluded_topic_ids = set(exclude_topic_ids or set()) | self.liked_topics(account_id)
 		candidates: list[dict[str, Any]] = []
 		for topic in self.topic_snapshots_for_day(account_id, local_day):
+			if topic.topic_id in excluded_topic_ids:
+				continue
 			topic_posts = [
 				post
 				for post in self.post_snapshots_for_topic(account_id, topic.topic_id)
-				if post.post_id not in excluded and post.text_length > 0
+				if post.post_id not in excluded_post_ids and post.text_length > 0
 			]
 			for post in topic_posts[:limit_per_topic]:
 				candidates.append(

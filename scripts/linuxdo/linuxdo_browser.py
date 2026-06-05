@@ -1473,6 +1473,13 @@ def build_parser() -> argparse.ArgumentParser:
 	run_all_parser.add_argument('--min-read-minutes', type=int, help='Minimum read minutes per account (0 disables)')
 	run_all_parser.add_argument('--daily-topic-limit', type=int, help='Max newly viewed topics per local day (0 disables)')
 	run_all_parser.add_argument('--daily-like-limit', type=int, help='Max likes per local day (0 disables)')
+	run_all_parser.add_argument(
+		'--skip-run-today',
+		dest='skip_run_today',
+		action=argparse.BooleanOptionalAction,
+		default=False,
+		help='Skip accounts that already have a run session today',
+	)
 	run_all_parser.add_argument('--headless', action='store_true', help='Run browser headless')
 
 	stats_parser = subparsers.add_parser('stats', help='Show browsing stats')
@@ -1670,6 +1677,7 @@ async def review_like_candidates(browser: LinuxDoBrowser, store: AccountStore, a
 		return
 
 	skipped_post_ids: set[str] = set()
+	liked_topic_ids = store.liked_topics(account.id)
 	while True:
 		remaining = like_review_target_remaining(browser.config, browser)
 		if remaining <= 0:
@@ -1680,6 +1688,7 @@ async def review_like_candidates(browser: LinuxDoBrowser, store: AccountStore, a
 			account.id,
 			limit_per_topic=MAX_LIKE_CANDIDATES_PER_TOPIC,
 			exclude_post_ids=skipped_post_ids,
+			exclude_topic_ids=liked_topic_ids,
 		)
 		if not candidates:
 			if browser.daily_topic_limit_reached():
@@ -1697,6 +1706,9 @@ async def review_like_candidates(browser: LinuxDoBrowser, store: AccountStore, a
 				console.print('[green]点赞数量已达到当前配置目标[/]')
 				return
 
+			topic_id = str(candidate['topic_id'])
+			if topic_id in liked_topic_ids:
+				continue
 			post_id = str(candidate['post_id'])
 			if post_id in skipped_post_ids or post_id in browser.state.liked_posts:
 				continue
@@ -1721,7 +1733,8 @@ async def review_like_candidates(browser: LinuxDoBrowser, store: AccountStore, a
 			await browser.handle_human_verification()
 			result = await browser.send_like(post_id)
 			if result.get('success'):
-				browser._record_like_success(post_id, topic_id=str(candidate['topic_id']))
+				browser._record_like_success(post_id, topic_id=topic_id)
+				liked_topic_ids.add(topic_id)
 			else:
 				console.print(f'[yellow]点赞失败:[/] {result.get("error")}')
 
@@ -1748,6 +1761,11 @@ def topic_payloads_for_llm(store: AccountStore, account: Account) -> list[dict[s
 
 def llm_candidate_counts(store: AccountStore, accounts: list[Account]) -> dict[int, int]:
 	return {account.id: len(llm_candidate_topics_for_account(store, account)) for account in accounts}
+
+
+def record_llm_candidates_processed(store: AccountStore, account: Account, topics: list[dict[str, str]]) -> None:
+	for topic_id in {str(topic['topic_id']) for topic in topics if topic.get('topic_id')}:
+		store.record_event(account.id, 'llm_processed', topic_id=topic_id)
 
 
 def llm_progress() -> Progress:
@@ -2040,6 +2058,7 @@ async def cmd_llm_reply(args: argparse.Namespace) -> int:
 		with llm_progress() as progress:
 			task = progress.add_task(f'LLM 正在筛选 {len(topics)} 个候选话题', total=None)
 			selected_topic_ids = await asyncio.to_thread(select_llm_topic_ids, config, topics, reply_count)
+			record_llm_candidates_processed(store, account, topics)
 			progress.update(task, description='LLM 话题筛选完成', total=1, completed=1)
 	except Exception as exc:
 		error_console.print(f'[bold red]LLM 话题筛选失败:[/] {exc}')
@@ -2063,7 +2082,6 @@ async def cmd_llm_reply(args: argparse.Namespace) -> int:
 			except Exception as exc:
 				generation_errors.append((topic_id, exc))
 			else:
-				store.record_event(account.id, 'llm_processed', topic_id=topic_id)
 				generated_replies.append((topic, reply))
 			finally:
 				progress.advance(task)
@@ -2186,6 +2204,15 @@ async def cmd_run_all(args: argparse.Namespace) -> int:
 	if not accounts:
 		error_console.print('[bold red]没有可运行的账号，请先执行 accounts add[/]')
 		return 1
+	if getattr(args, 'skip_run_today', False):
+		run_statuses = account_run_statuses(store, accounts)
+		skipped_accounts = [account for account in accounts if run_statuses.get(account.id, (False, '-'))[0]]
+		accounts = [account for account in accounts if not run_statuses.get(account.id, (False, '-'))[0]]
+		if skipped_accounts:
+			console.print('[dim]跳过今日已执行账号: ' + ', '.join(account.name for account in skipped_accounts) + '[/]')
+		if not accounts:
+			console.print('[yellow]没有需要运行的账号，今日已执行账号已全部跳过[/]')
+			return 0
 
 	exit_code = 0
 	for index, account in enumerate(accounts):
@@ -2427,6 +2454,7 @@ def tui_args(command: str, **overrides: Any) -> argparse.Namespace:
 		'yes': False,
 		'cookies': None,
 		'file': None,
+		'skip_run_today': False,
 	}
 	defaults.update(overrides)
 	return argparse.Namespace(**defaults)
@@ -2556,6 +2584,9 @@ def tui_collect_run_args(account_slug: str | None, command: str = 'run') -> argp
 	if enable_like:
 		like_chance = Prompt.ask('备用点赞节奏', choices=list(LIKE_CHANCE_PRESETS), default=config.like_chance)
 	headless = Confirm.ask('无头运行', default=config.headless)
+	skip_run_today = False
+	if command == 'run-all':
+		skip_run_today = Confirm.ask('跳过今日已执行账号', default=True)
 	return tui_args(
 		command,
 		account=account_slug,
@@ -2569,6 +2600,7 @@ def tui_collect_run_args(account_slug: str | None, command: str = 'run') -> argp
 		enable_like=enable_like,
 		like_chance=like_chance,
 		headless=headless,
+		skip_run_today=skip_run_today,
 	)
 
 
@@ -2681,7 +2713,8 @@ async def tui_browse_menu() -> None:
 			tui_pause()
 		elif choice == '3':
 			if Confirm.ask('按当前配置运行所有启用账号？', default=True):
-				await cmd_run_all(tui_args('run-all'))
+				skip_run_today = Confirm.ask('跳过今日已执行账号？', default=True)
+				await cmd_run_all(tui_args('run-all', skip_run_today=skip_run_today))
 				tui_pause()
 		elif choice == '4':
 			await cmd_run_all(tui_collect_run_args(None, command='run-all'))

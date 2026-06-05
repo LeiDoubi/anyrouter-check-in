@@ -104,6 +104,18 @@ def test_parser_accepts_review_and_llm_reply_commands():
 	assert no_llm_args.enable_llm_reply is False
 
 
+def test_parser_accepts_run_all_skip_today_option():
+	parser = build_parser()
+
+	default_args = parser.parse_args(['run-all'])
+	skip_args = parser.parse_args(['run-all', '--skip-run-today'])
+	no_skip_args = parser.parse_args(['run-all', '--no-skip-run-today'])
+
+	assert default_args.skip_run_today is False
+	assert skip_args.skip_run_today is True
+	assert no_skip_args.skip_run_today is False
+
+
 def test_tui_args_provides_cli_defaults():
 	args = tui_args('run', account='main')
 
@@ -113,6 +125,7 @@ def test_tui_args_provides_cli_defaults():
 	assert args.max_topics is None
 	assert args.enable_like is None
 	assert args.enable_llm_reply is None
+	assert args.skip_run_today is False
 
 
 def test_browser_config_enables_llm_reply_by_default():
@@ -152,6 +165,114 @@ def test_llm_candidate_topics_exclude_processed_today(tmp_path):
 	store.record_event(account.id, 'llm_processed', topic_id='101')
 
 	assert [topic['topic_id'] for topic in llm_candidate_topics_for_account(store, account)] == ['102']
+
+
+@pytest.mark.asyncio
+async def test_llm_reply_consumes_screened_topics_even_when_none_selected(tmp_path, monkeypatch):
+	store = AccountStore(tmp_path / 'linuxdo.sqlite3', tmp_path / 'profiles')
+	store.init_db()
+	account = store.add_account('main')
+
+	for topic_id in ('101', '102'):
+		store.record_event(account.id, 'topic_view', topic_id=topic_id)
+		store.upsert_topic_snapshot(account.id, topic_id, f'Topic {topic_id}', f'https://linux.do/t/topic/{topic_id}/1')
+
+	def fake_select_topic_ids(_config, topics, _count):
+		assert {topic['topic_id'] for topic in topics} == {'101', '102'}
+		return []
+
+	monkeypatch.setattr(linuxdo_browser, 'load_config', BrowserConfig)
+	monkeypatch.setattr(linuxdo_browser, 'get_store', lambda: store)
+	monkeypatch.setattr(linuxdo_browser, 'select_llm_topic_ids', fake_select_topic_ids)
+
+	result = await linuxdo_browser.cmd_llm_reply(tui_args('llm-reply', account='main', count=1))
+
+	assert result == 1
+	assert llm_candidate_topics_for_account(store, account) == []
+
+
+@pytest.mark.asyncio
+async def test_review_likes_only_likes_one_post_per_topic(tmp_path, monkeypatch):
+	store = AccountStore(tmp_path / 'linuxdo.sqlite3', tmp_path / 'profiles')
+	store.init_db()
+	account = store.add_account('main')
+	store.record_event(account.id, 'topic_view', topic_id='101')
+	store.upsert_topic_snapshot(account.id, '101', 'Useful topic', 'https://linux.do/t/topic/101/1')
+	store.upsert_post_snapshot(account.id, '101', 'p1', 'short candidate', author='a')
+	store.upsert_post_snapshot(account.id, '101', 'p2', 'longer candidate that should be reviewed first', author='b')
+
+	class FakeStdin:
+		def isatty(self):
+			return True
+
+	class FakePage:
+		def __init__(self):
+			self.urls = []
+
+		async def goto(self, url, wait_until):
+			self.urls.append((url, wait_until))
+
+	class FakeBrowser:
+		def __init__(self):
+			self.config = BrowserConfig(max_likes_per_session=2, daily_like_limit=0, headless=False)
+			self.state = BrowserState()
+			self.page = FakePage()
+			self.sent_likes = []
+
+		def daily_topic_limit_reached(self):
+			return True
+
+		async def handle_human_verification(self):
+			return None
+
+		async def send_like(self, post_id):
+			self.sent_likes.append(post_id)
+			return {'success': True}
+
+		def _record_like_success(self, post_id, topic_id=None):
+			self.state.liked_posts.add(post_id)
+			self.state.session_liked += 1
+			store.record_event(account.id, 'like_given', topic_id=topic_id, post_id=post_id)
+
+	prompted = []
+
+	def fake_prompt_ask(*_args, **_kwargs):
+		prompted.append(True)
+		return 'y'
+
+	browser = FakeBrowser()
+	monkeypatch.setattr(linuxdo_browser.sys, 'stdin', FakeStdin())
+	monkeypatch.setattr(linuxdo_browser.Prompt, 'ask', fake_prompt_ask)
+
+	await linuxdo_browser.review_like_candidates(browser, store, account)
+
+	assert prompted == [True]
+	assert browser.sent_likes == ['p2']
+	assert store.liked_topics(account.id) == {'101'}
+
+
+@pytest.mark.asyncio
+async def test_run_all_skips_accounts_run_today(tmp_path, monkeypatch):
+	store = AccountStore(tmp_path / 'linuxdo.sqlite3', tmp_path / 'profiles')
+	store.init_db()
+	first = store.add_account('first')
+	second = store.add_account('second')
+	store.start_run(first.id)
+	run_accounts = []
+
+	async def fake_cmd_run(args):
+		run_accounts.append(args.account)
+		return 0
+
+	monkeypatch.setattr(linuxdo_browser, 'load_config', BrowserConfig)
+	monkeypatch.setattr(linuxdo_browser, 'save_config', lambda _config: None)
+	monkeypatch.setattr(linuxdo_browser, 'get_store', lambda: store)
+	monkeypatch.setattr(linuxdo_browser, 'cmd_run', fake_cmd_run)
+
+	result = await linuxdo_browser.cmd_run_all(tui_args('run-all', skip_run_today=True))
+
+	assert result == 0
+	assert run_accounts == [second.slug]
 
 
 @pytest.mark.asyncio
