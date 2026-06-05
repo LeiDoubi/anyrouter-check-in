@@ -14,3 +14,4 @@ accounts
 data
 .playwright-mcp/*.log
 coverage.xml
+.coverage

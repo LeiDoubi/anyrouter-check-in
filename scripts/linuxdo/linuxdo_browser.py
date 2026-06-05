@@ -2429,6 +2429,11 @@ def tui_pause(message: str = '按 Enter 返回') -> None:
 	Prompt.ask(f'[dim]{message}[/]', default='', show_default=False)
 
 
+def tui_clear_screen() -> None:
+	if console.is_terminal:
+		console.clear()
+
+
 def tui_args(command: str, **overrides: Any) -> argparse.Namespace:
 	defaults: dict[str, Any] = {
 		'command': command,
@@ -2460,7 +2465,9 @@ def tui_args(command: str, **overrides: Any) -> argparse.Namespace:
 	return argparse.Namespace(**defaults)
 
 
-def tui_menu(title: str, options: list[tuple[str, str]], default: str = '0') -> str:
+def tui_menu(title: str, options: list[tuple[str, str]], default: str = '0', *, clear_screen: bool = True) -> str:
+	if clear_screen:
+		tui_clear_screen()
 	table = Table(title=title, header_style='bold cyan')
 	table.add_column('选择', justify='center', no_wrap=True)
 	table.add_column('操作')
@@ -2520,7 +2527,10 @@ def tui_select_account(
 	allow_cancel: bool = True,
 	show_run_status: bool = False,
 	show_llm_candidates: bool = False,
+	clear_screen: bool = True,
 ) -> str | None:
+	if clear_screen:
+		tui_clear_screen()
 	accounts = store.list_accounts()
 	if not accounts:
 		accounts = [store.get_or_create_default_account()]
@@ -2816,15 +2826,16 @@ def tui_data_menu() -> None:
 
 async def cmd_tui(args: argparse.Namespace) -> int:
 	_ = args
-	console.print(
-		Panel(
-			'使用数字选择子菜单；现有 CLI 命令仍可直接调用。',
-			title='Linux.do TUI',
-			border_style='bright_blue',
-		)
-	)
 	while True:
 		try:
+			tui_clear_screen()
+			console.print(
+				Panel(
+					'使用数字选择子菜单；现有 CLI 命令仍可直接调用。',
+					title='Linux.do TUI',
+					border_style='bright_blue',
+				)
+			)
 			choice = tui_menu(
 				'主菜单',
 				[
@@ -2835,6 +2846,7 @@ async def cmd_tui(args: argparse.Namespace) -> int:
 					('5', '数据管理'),
 					('0', '退出'),
 				],
+				clear_screen=False,
 			)
 			if choice == '0':
 				console.print('[dim]已退出[/]')

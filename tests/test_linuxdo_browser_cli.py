@@ -128,6 +128,31 @@ def test_tui_args_provides_cli_defaults():
 	assert args.skip_run_today is False
 
 
+def test_tui_menu_clears_terminal_before_render(monkeypatch):
+	class FakeConsole:
+		is_terminal = True
+
+		def __init__(self):
+			self.cleared = 0
+			self.rendered = []
+
+		def clear(self):
+			self.cleared += 1
+
+		def print(self, value):
+			self.rendered.append(value)
+
+	fake_console = FakeConsole()
+	monkeypatch.setattr(linuxdo_browser, 'console', fake_console)
+	monkeypatch.setattr(linuxdo_browser.Prompt, 'ask', lambda *_args, **_kwargs: '0')
+
+	choice = linuxdo_browser.tui_menu('测试菜单', [('0', '退出')])
+
+	assert choice == '0'
+	assert fake_console.cleared == 1
+	assert fake_console.rendered
+
+
 def test_browser_config_enables_llm_reply_by_default():
 	assert BrowserConfig().enable_llm_reply is True
 
