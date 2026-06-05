@@ -491,10 +491,10 @@ def save_active_state(index: int, name: str) -> None:
 
 
 def resolve_base_url(provider_name: str, app_config: AppConfig) -> str:
-	provider = app_config.get_provider(provider_name)
-	if provider is None:
-		return DEFAULT_BASE_URL
-	return provider.domain.rstrip('/')
+	# provider = app_config.get_provider(provider_name)
+	# if provider is None:
+	return DEFAULT_BASE_URL.rstrip('/')
+	# return provider.domain.rstrip('/')
 
 
 def get_auth_token(account: dict[str, Any]) -> str:
