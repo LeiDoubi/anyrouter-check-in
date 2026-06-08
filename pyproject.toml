@@ -20,6 +20,7 @@ dependencies = [
 [project.scripts]
 anyrouter-accounts = "scripts.anyrouter_accounts:main"
 linuxdo-browser = "scripts.linuxdo.linuxdo_browser:main"
+setup-cc-proxy = "scripts.setup_cc_proxy:main"
 
 [tool.setuptools]
 py-modules = ["checkin"]
