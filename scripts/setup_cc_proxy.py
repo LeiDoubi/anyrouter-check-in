@@ -88,8 +88,45 @@ backup_file() {{
   fi
 }}
 
+run_apt_get() {{
+  if [[ "${{EUID:-$(id -u)}}" -eq 0 ]]; then
+    apt-get "$@"
+    return
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    sudo apt-get "$@"
+    return
+  fi
+
+  printf 'ERROR: apt-get requires root or sudo.\n' >&2
+  return 1
+}}
+
+install_npm_with_apt() {{
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    return 1
+  fi
+
+  if ! command -v apt-get >/dev/null 2>&1; then
+    return 1
+  fi
+
+  printf 'npm not found; installing via apt...\n'
+  if ! run_apt_get update -qq; then
+    return 1
+  fi
+
+  DEBIAN_FRONTEND=noninteractive run_apt_get install -y npm
+}}
+
 ensure_npm_available() {{
   if command -v npm >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if install_npm_with_apt && command -v npm >/dev/null 2>&1; then
+    printf 'npm installed: %s\n' "$(command -v npm)"
     return 0
   fi
 
