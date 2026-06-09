@@ -53,9 +53,14 @@ class ConfigPayload:
 
 
 DEFAULT_CONFIG_SPECS = [
-	ConfigSpec('Claude Code settings', Path.home() / '.claude' / 'settings.json', '.claude/settings.json'),
-	ConfigSpec('Codex auth', Path.home() / '.codex' / 'auth.json', '.codex/auth.json'),
-	ConfigSpec('Codex config', Path.home() / '.codex' / 'config.toml', '.codex/config.toml'),
+	ConfigSpec(
+		'Claude Code settings',
+		Path.home() / '.claude' / 'settings.json',
+		'.claude/settings.json',
+		required=False,
+	),
+	ConfigSpec('Codex auth', Path.home() / '.codex' / 'auth.json', '.codex/auth.json', required=False),
+	ConfigSpec('Codex config', Path.home() / '.codex' / 'config.toml', '.codex/config.toml', required=False),
 ]
 
 OPTIONAL_CONFIG_SPECS = {
@@ -143,6 +148,27 @@ prepend_path_once() {{
   esac
 }}
 
+run_npm_install_global() {{
+  local package="$1"
+
+  if npm install -g "$package"; then
+    return 0
+  fi
+
+  if [[ "${{EUID:-$(id -u)}}" -eq 0 ]]; then
+    return 1
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    printf 'Global npm install failed; retrying with sudo...\n'
+    sudo npm install -g "$package"
+    return
+  fi
+
+  printf 'ERROR: global npm install failed and sudo is unavailable.\n' >&2
+  return 1
+}}
+
 install_npm_cli() {{
   local label="$1"
   local binary="$2"
@@ -156,7 +182,7 @@ install_npm_cli() {{
   ensure_npm_available
   printf '%s not found; installing %s...\n' "$label" "$package"
 
-  if npm install -g "$package"; then
+  if run_npm_install_global "$package"; then
     hash -r 2>/dev/null || true
   fi
 
@@ -303,7 +329,10 @@ def parse_args() -> argparse.Namespace:
 		'--port',
 		type=int,
 		default=None,
-		help='Local HTTP proxy port. Defaults to the single localhost URL port found in Claude/Codex configs.',
+		help=(
+			'Local HTTP proxy port. Defaults to the single localhost URL port found in Claude/Codex configs. '
+			'Required when local Claude/Codex config files are missing.'
+		),
 	)
 	parser.add_argument(
 		'--public-url',
@@ -350,22 +379,34 @@ def config_specs_from_args(args: argparse.Namespace) -> list[ConfigSpec]:
 	return specs
 
 
-def read_config_texts(specs: list[ConfigSpec]) -> dict[ConfigSpec, str]:
+def read_config_texts(specs: list[ConfigSpec]) -> tuple[dict[ConfigSpec, str], list[ConfigSpec]]:
 	texts: dict[ConfigSpec, str] = {}
-	missing_required: list[Path] = []
+	missing: list[ConfigSpec] = []
 
 	for spec in specs:
 		if not spec.source.is_file():
-			if spec.required:
-				missing_required.append(spec.source)
+			missing.append(spec)
 			continue
 		texts[spec] = spec.source.read_text(encoding='utf-8')
 
-	if missing_required:
-		missing = '\n'.join(f'  - {path}' for path in missing_required)
-		raise FileNotFoundError(f'missing required config files:\n{missing}')
+	return texts, missing
 
-	return texts
+
+def warn_missing_local_configs(missing: list[ConfigSpec], plain: bool) -> None:
+	if not missing:
+		return
+
+	lines = '\n'.join(f'  - {spec.source} ({spec.label})' for spec in missing)
+	message = (
+		'本地未找到以下 Claude/Codex 配置文件，将跳过打包；'
+		'生成的脚本仍会安装客户端。\n'
+		f'{lines}\n'
+		'若无法从现有配置推断代理端口，请使用 --port。'
+	)
+	if plain:
+		print(f'WARNING: {message}', file=sys.stderr)
+	else:
+		error_console.print(f'[yellow]WARNING:[/] {message}')
 
 
 def iter_local_proxy_ports(texts: dict[ConfigSpec, str]) -> list[int]:
@@ -476,7 +517,7 @@ def render_generation_result(
 	plain: bool,
 ) -> None:
 	replaced = sum(payload.replacements for payload in payloads)
-	packaged = ', '.join(payload.spec.label for payload in payloads)
+	packaged = ', '.join(payload.spec.label for payload in payloads) or '（无，仅安装客户端）'
 
 	if plain:
 		if changed:
@@ -503,9 +544,17 @@ def render_generation_result(
 	console.print(Panel(body, title='setup_cc_codex.bash', border_style='green' if not changed else 'yellow'))
 
 
-def generate_setup_script(args: argparse.Namespace, public_url: str, port: int) -> tuple[Path, bool, list[ConfigPayload]]:
+def load_local_config_texts(
+	args: argparse.Namespace,
+) -> tuple[dict[ConfigSpec, str], list[ConfigSpec]]:
 	specs = config_specs_from_args(args)
-	texts = read_config_texts(specs)
+	texts, missing = read_config_texts(specs)
+	warn_missing_local_configs(missing, args.plain)
+	return texts, missing
+
+
+def generate_setup_script(args: argparse.Namespace, public_url: str, port: int) -> tuple[Path, bool, list[ConfigPayload]]:
+	texts, _missing = load_local_config_texts(args)
 	payloads = build_payloads(texts, port, public_url)
 	content = build_setup_script(payloads, port, public_url)
 	output = args.output.expanduser()
@@ -544,8 +593,7 @@ def warn_local_port_if_needed(port: int, plain: bool) -> None:
 
 
 def run_with_existing_public_url(args: argparse.Namespace) -> int:
-	specs = config_specs_from_args(args)
-	texts = read_config_texts(specs)
+	texts, _missing = load_local_config_texts(args)
 	port = resolve_proxy_port(args, texts)
 	public_url = normalize_public_url(args.public_url)
 	output, changed, payloads = generate_setup_script(args, public_url, port)
@@ -554,8 +602,7 @@ def run_with_existing_public_url(args: argparse.Namespace) -> int:
 
 
 def run_with_lyf_expose(args: argparse.Namespace) -> int:
-	specs = config_specs_from_args(args)
-	texts = read_config_texts(specs)
+	texts, _missing = load_local_config_texts(args)
 	port = resolve_proxy_port(args, texts)
 	warn_local_port_if_needed(port, args.plain)
 
