@@ -148,25 +148,30 @@ prepend_path_once() {{
   esac
 }}
 
-run_npm_install_global() {{
-  local package="$1"
+npm_global_prefix() {{
+  npm config get prefix 2>/dev/null | tr -d '\r\n' || printf '/usr/local'
+}}
 
-  if npm install -g "$package"; then
+npm_global_prefix_writable() {{
+  local prefix
+  prefix="$(npm_global_prefix)"
+  [[ -n "$prefix" ]] || return 1
+  if [[ -w "$prefix" ]]; then
     return 0
   fi
-
-  if [[ "${{EUID:-$(id -u)}}" -eq 0 ]]; then
-    return 1
+  if [[ ! -e "$prefix" ]] && [[ -w "$(dirname "$prefix")" ]]; then
+    return 0
   fi
-
-  if command -v sudo >/dev/null 2>&1; then
-    printf 'Global npm install failed; retrying with sudo...\n'
-    sudo npm install -g "$package"
-    return
-  fi
-
-  printf 'ERROR: global npm install failed and sudo is unavailable.\n' >&2
   return 1
+}}
+
+install_npm_cli_to_user_prefix() {{
+  local package="$1"
+
+  mkdir -p "$NPM_USER_PREFIX"
+  NPM_CONFIG_PREFIX="$NPM_USER_PREFIX" npm install -g "$package"
+  prepend_path_once "$NPM_USER_PREFIX/bin"
+  NEEDS_NPM_USER_PATH=1
 }}
 
 install_npm_cli() {{
@@ -182,7 +187,12 @@ install_npm_cli() {{
   ensure_npm_available
   printf '%s not found; installing %s...\n' "$label" "$package"
 
-  if run_npm_install_global "$package"; then
+  if npm_global_prefix_writable; then
+    npm install -g "$package" || true
+    hash -r 2>/dev/null || true
+  else
+    printf 'System npm prefix %s is not writable; using %s\n' "$(npm_global_prefix)" "$NPM_USER_PREFIX"
+    install_npm_cli_to_user_prefix "$package"
     hash -r 2>/dev/null || true
   fi
 
@@ -191,12 +201,11 @@ install_npm_cli() {{
     return 0
   fi
 
-  printf 'Global npm install did not expose %s; retrying with user prefix %s...\n' "$binary" "$NPM_USER_PREFIX"
-  mkdir -p "$NPM_USER_PREFIX"
-  NPM_CONFIG_PREFIX="$NPM_USER_PREFIX" npm install -g "$package"
-  prepend_path_once "$NPM_USER_PREFIX/bin"
-  NEEDS_NPM_USER_PATH=1
-  hash -r 2>/dev/null || true
+  if [[ "$NEEDS_NPM_USER_PATH" != "1" ]]; then
+    printf 'Global npm install did not expose %s; retrying with user prefix %s...\n' "$binary" "$NPM_USER_PREFIX"
+    install_npm_cli_to_user_prefix "$package"
+    hash -r 2>/dev/null || true
+  fi
 
   if ! command -v "$binary" >/dev/null 2>&1; then
     printf 'ERROR: %s installation finished but %s is still not on PATH.\n' "$label" "$binary" >&2
