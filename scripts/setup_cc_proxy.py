@@ -204,12 +204,40 @@ ensure_user_path_hook() {{
   }} >> "$rc_file"
 }}
 
+ensure_ssl_cert_file_hook() {{
+  local rc_file="$1"
+  local hook_line='export SSL_CERT_FILE=/usr/lib/ssl/cert.pem'
+
+  mkdir -p "$(dirname "$rc_file")"
+  touch "$rc_file"
+  if grep -F 'SSL_CERT_FILE=/usr/lib/ssl/cert.pem' "$rc_file" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  backup_file "$rc_file"
+  {{
+    printf '\n# Added by setup_cc_codex.bash\n'
+    printf '# Codex uses rustls when SSL_CERT_FILE is set (lyf-expose SAN mismatch workaround).\n'
+    printf '%s\n' "$hook_line"
+  }} >> "$rc_file"
+}}
+
+ensure_linux_ssl_cert_file() {{
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    return 0
+  fi
+
+  ensure_ssl_cert_file_hook "${{HOME}}/.zshrc"
+  ensure_ssl_cert_file_hook "${{HOME}}/.bashrc"
+}}
+
 main() {{
   ensure_clients
 
 """
 
 SETUP_SCRIPT_FOOTER = r"""
+  ensure_linux_ssl_cert_file
   ensure_user_path_hook "${HOME}/.zshrc"
   ensure_user_path_hook "${HOME}/.bashrc"
 
