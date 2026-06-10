@@ -165,7 +165,7 @@ MUYUAN_CONTINUE_SELECTORS = (
 	'button:has-text("LinuxDO")',
 	'a:has-text("LinuxDO")',
 )
-LINUXDO_OAUTH_AUTHORIZE_URL = re.compile(r'https://(?:connect\.)?linux\.do/oauth2/authorize')
+LINUXDO_OAUTH_AUTHORIZE_URL = re.compile(r'https://(?:connect\.)?linux\.do/oauth2/(?:authorize|approve)')
 LINUXDO_OAUTH_ALLOW_NAME = re.compile(r'允许|授权|allow|authorize', re.I)
 LINUXDO_OAUTH_ALLOW_CLICK_SCRIPT = """
 () => {
@@ -173,7 +173,7 @@ LINUXDO_OAUTH_ALLOW_CLICK_SCRIPT = """
 	const denyTexts = ['取消', '拒绝', 'cancel', 'deny'];
 	const nodes = [
 		...document.querySelectorAll(
-			'button, input[type="submit"], a.btn, a.btn-primary, [role="button"]'
+			'button, input[type="submit"], a[href*="/oauth2/approve/"], a.btn, a.btn-primary, a.btn-pill, a.btn-pill-primary, [role="button"]'
 		),
 	];
 	const matchesAllow = (el) => {
@@ -186,12 +186,12 @@ LINUXDO_OAUTH_ALLOW_CLICK_SCRIPT = """
 	let target = nodes.find(matchesAllow);
 	if (!target) {
 		target = document.querySelector(
-			'button[name="button"][value="authorize"], input[name="button"][value="authorize"], button[value="authorize"], input[value="authorize"], button[name="authorize"]'
+			'a[href*="/oauth2/approve/"], button[name="button"][value="authorize"], input[name="button"][value="authorize"], button[value="authorize"], input[value="authorize"], button[name="authorize"]'
 		);
 	}
 	if (!target) {
 		const primaryButtons = [
-			...document.querySelectorAll('button.btn-primary, a.btn-primary, input.btn-primary'),
+			...document.querySelectorAll('button.btn-primary, a.btn-primary, a.btn-pill-primary, input.btn-primary'),
 		];
 		target = primaryButtons.find((el) => {
 			const text = (el.textContent || el.value || '').toLowerCase();
@@ -203,7 +203,7 @@ LINUXDO_OAUTH_ALLOW_CLICK_SCRIPT = """
 	return true;
 }
 """
-MUYUAN_AUTHENTICATED_URL = re.compile(r'https://muyuan\.do/(?:console|oauth)')
+MUYUAN_AUTHENTICATED_URL = re.compile(r'https://muyuan\.do/console(?:/|$)')
 MUYUAN_CHECKIN_SELECTORS = (
 	'button:has-text("Check in now")',
 	'button:has-text("立即签到")',
@@ -997,9 +997,7 @@ class LinuxDoBrowser:
 	def find_muyuan_authenticated_page(self) -> Page | None:
 		for candidate in self.context.pages:
 			url = candidate.url
-			if MUYUAN_AUTHENTICATED_URL.match(url) or (
-				url.startswith(MUYUAN_BASE_URL) and '/login' not in url
-			):
+			if MUYUAN_AUTHENTICATED_URL.match(url):
 				return candidate
 		return None
 
@@ -1025,8 +1023,11 @@ class LinuxDoBrowser:
 		for locator in (
 			page.locator('button[name="button"][value="authorize"]').first,
 			page.get_by_role('button', name=LINUXDO_OAUTH_ALLOW_NAME).first,
+			page.get_by_role('link', name=LINUXDO_OAUTH_ALLOW_NAME).first,
 			page.locator('button:has-text("允许")').first,
-			page.locator('form button.btn-primary').first,
+			page.locator('a[href*="/oauth2/approve/"]').first,
+			page.locator('a.btn-pill-primary:has-text("允许")').first,
+			page.locator('form button.btn-primary, form a.btn-pill-primary').first,
 		):
 			try:
 				if await locator.count() == 0:
@@ -1045,7 +1046,8 @@ class LinuxDoBrowser:
 		deadline = time.monotonic() + timeout_ms / 1000
 		ready_selector = (
 			'button[name="button"][value="authorize"], '
-			'button:has-text("允许"), form button.btn-primary'
+			'button:has-text("允许"), a[href*="/oauth2/approve/"], '
+			'a.btn-pill-primary:has-text("允许"), form button.btn-primary, form a.btn-pill-primary'
 		)
 		while time.monotonic() < deadline:
 			if await self.try_click_linuxdo_oauth_allow_once(page):
@@ -1059,9 +1061,13 @@ class LinuxDoBrowser:
 	async def wait_for_oauth_authorize_redirect(self, page: Page, timeout_ms: int = 12000) -> None:
 		with contextlib.suppress(PlaywrightError, PlaywrightTimeoutError):
 			await page.wait_for_function(
-				"() => !/oauth2\\/authorize/.test(location.href)",
+				"() => !/oauth2\\/(?:authorize|approve)/.test(location.href)",
 				timeout=timeout_ms,
 			)
+
+	def open_page_urls(self) -> str:
+		urls = [page.url for page in self.context.pages]
+		return ', '.join(urls) if urls else '<无>'
 
 	async def wait_for_muyuan_oauth_finish(self, timeout_ms: int = 15000) -> bool:
 		deadline = time.monotonic() + timeout_ms / 1000
@@ -1126,11 +1132,11 @@ class LinuxDoBrowser:
 			await asyncio.sleep(0.2)
 
 	async def authorize_muyuan_with_linuxdo(self) -> None:
-		await self.ensure_logged_in(interactive=can_interactive_login(self.config))
 		if await self.is_muyuan_authenticated():
 			self.log('muyuan 已登录')
 			return
 
+		await self.ensure_logged_in(interactive=can_interactive_login(self.config))
 		self.log('打开 muyuan 登录页')
 		await self.page.goto(MUYUAN_LOGIN_URL, wait_until='domcontentloaded')
 		await self.accept_muyuan_agreement()
@@ -1146,7 +1152,7 @@ class LinuxDoBrowser:
 
 		if not await self.is_muyuan_authenticated():
 			raise RuntimeError(
-				f'muyuan 登录未完成（当前页面: {self.page.url}）。'
+				f'muyuan 登录未完成（当前页面: {self.page.url}；打开页面: {self.open_page_urls()}）。'
 				'请确认 LinuxDO 已登录且 OAuth 已允许'
 			)
 		self.log('muyuan 登录完成')

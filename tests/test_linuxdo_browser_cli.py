@@ -364,6 +364,81 @@ async def test_muyuan_checkin_records_success_and_closes_browser(tmp_path, monke
 
 
 @pytest.mark.asyncio
+async def test_muyuan_auth_reuses_existing_muyuan_session(monkeypatch):
+	browser = LinuxDoBrowser(BrowserConfig(), BrowserState())
+	calls = []
+
+	async def fake_is_muyuan_authenticated():
+		calls.append('muyuan')
+		return True
+
+	async def fail_ensure_logged_in(**_kwargs):
+		raise AssertionError('LinuxDO should not be opened when muyuan is already logged in')
+
+	monkeypatch.setattr(browser, 'is_muyuan_authenticated', fake_is_muyuan_authenticated)
+	monkeypatch.setattr(browser, 'ensure_logged_in', fail_ensure_logged_in)
+
+	await browser.authorize_muyuan_with_linuxdo()
+
+	assert calls == ['muyuan']
+
+
+@pytest.mark.asyncio
+async def test_linuxdo_oauth_allow_clicks_approve_link():
+	clicked_selectors = []
+
+	class FakeLocator:
+		def __init__(self, selector):
+			self.selector = selector
+
+		@property
+		def first(self):
+			return self
+
+		async def count(self):
+			return 1 if self.selector == 'a[href*="/oauth2/approve/"]' else 0
+
+		async def click(self, **_kwargs):
+			clicked_selectors.append(self.selector)
+
+	class FakePage:
+		async def evaluate(self, _script):
+			return False
+
+		def locator(self, selector):
+			return FakeLocator(selector)
+
+		def get_by_role(self, role, **_kwargs):
+			return FakeLocator(f'role:{role}')
+
+	browser = LinuxDoBrowser(BrowserConfig(), BrowserState())
+
+	assert await browser.try_click_linuxdo_oauth_allow_once(FakePage()) is True
+	assert clicked_selectors == ['a[href*="/oauth2/approve/"]']
+
+
+def test_muyuan_authenticated_page_requires_console_url():
+	class FakePage:
+		def __init__(self, url):
+			self.url = url
+
+	class FakeContext:
+		def __init__(self, pages):
+			self.pages = pages
+
+	oauth_page = FakePage('https://muyuan.do/oauth/callback')
+	login_page = FakePage('https://muyuan.do/login?expired=true')
+	console_page = FakePage('https://muyuan.do/console/personal')
+	browser = LinuxDoBrowser(BrowserConfig(), BrowserState())
+
+	browser._context = FakeContext([oauth_page, login_page])
+	assert browser.find_muyuan_authenticated_page() is None
+
+	browser._context = FakeContext([oauth_page, console_page])
+	assert browser.find_muyuan_authenticated_page() is console_page
+
+
+@pytest.mark.asyncio
 async def test_scroll_down_uses_mouse_wheel():
 	class FakeMouse:
 		def __init__(self):
