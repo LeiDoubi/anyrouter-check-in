@@ -2,6 +2,7 @@ import codecs
 import os
 
 import pytest
+from sqlalchemy import select
 
 from scripts.linuxdo import linuxdo_browser
 from scripts.linuxdo.linuxdo_browser import (
@@ -17,7 +18,7 @@ from scripts.linuxdo.linuxdo_browser import (
 	topic_list_has_new_content,
 	tui_args,
 )
-from scripts.linuxdo.linuxdo_store import AccountStore
+from scripts.linuxdo.linuxdo_store import AccountStore, ActivityEvent
 
 
 def test_legacy_entrypoint_module_exports_main():
@@ -119,6 +120,19 @@ def test_parser_accepts_run_all_skip_today_option():
 	assert no_skip_args.skip_run_today is False
 
 
+def test_parser_accepts_muyuan_checkin_command():
+	parser = build_parser()
+
+	single_args = parser.parse_args(['muyuan-checkin', '--account', 'main', '--headless'])
+	all_args = parser.parse_args(['muyuan-checkin', '--all'])
+
+	assert single_args.command == 'muyuan-checkin'
+	assert single_args.account == 'main'
+	assert single_args.headless is True
+	assert single_args.all is False
+	assert all_args.all is True
+
+
 def test_tui_args_provides_cli_defaults():
 	args = tui_args('run', account='main')
 
@@ -129,6 +143,7 @@ def test_tui_args_provides_cli_defaults():
 	assert args.enable_like is None
 	assert args.enable_llm_reply is None
 	assert args.skip_run_today is False
+	assert args.all is False
 
 
 def test_tui_menu_clears_terminal_before_render(monkeypatch):
@@ -136,23 +151,25 @@ def test_tui_menu_clears_terminal_before_render(monkeypatch):
 		is_terminal = True
 
 		def __init__(self):
-			self.cleared = 0
 			self.rendered = []
-
-		def clear(self):
-			self.cleared += 1
 
 		def print(self, value):
 			self.rendered.append(value)
 
+	cleared = {'count': 0}
+
+	def fake_clear_screen():
+		cleared['count'] += 1
+
 	fake_console = FakeConsole()
 	monkeypatch.setattr(linuxdo_browser, 'console', fake_console)
+	monkeypatch.setattr(linuxdo_browser, 'tui_clear_screen', fake_clear_screen)
 	monkeypatch.setattr(linuxdo_browser.Prompt, 'ask', lambda *_args, **_kwargs: '0')
 
 	choice = linuxdo_browser.tui_menu('测试菜单', [('0', '退出')])
 
 	assert choice == '0'
-	assert fake_console.cleared == 1
+	assert cleared['count'] == 1
 	assert fake_console.rendered
 
 
@@ -313,6 +330,45 @@ async def test_run_all_skips_accounts_run_today(tmp_path, monkeypatch):
 
 	assert result == 0
 	assert run_accounts == [second.slug]
+
+
+@pytest.mark.asyncio
+async def test_muyuan_checkin_records_success_and_closes_browser(tmp_path, monkeypatch):
+	store = AccountStore(tmp_path / 'linuxdo.sqlite3', tmp_path / 'profiles')
+	store.init_db()
+	account = store.add_account('main')
+
+	class FakeBrowser:
+		closed = False
+
+		async def launch(self, playwright):
+			self.playwright = playwright
+
+		async def muyuan_checkin(self):
+			return True
+
+		async def close(self):
+			self.closed = True
+
+	class FakePlaywright:
+		async def __aenter__(self):
+			return object()
+
+		async def __aexit__(self, exc_type, exc, tb):
+			return False
+
+	fake_browser = FakeBrowser()
+
+	monkeypatch.setattr(linuxdo_browser, 'build_browser_for_account', lambda config, store, account: fake_browser)
+	monkeypatch.setattr(linuxdo_browser, 'async_playwright', lambda: FakePlaywright())
+
+	result = await linuxdo_browser.muyuan_checkin_for_account(BrowserConfig(), store, account)
+
+	with store.session() as session:
+		events = list(session.scalars(select(ActivityEvent).where(ActivityEvent.account_id == account.id)).all())
+	assert result is True
+	assert fake_browser.closed is True
+	assert [event.event_type for event in events] == ['muyuan_checkin']
 
 
 @pytest.mark.asyncio

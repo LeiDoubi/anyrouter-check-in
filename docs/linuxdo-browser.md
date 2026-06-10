@@ -14,6 +14,7 @@
 - 点赞审核：浏览完成后按今日浏览话题生成候选，每个话题最多 2 个帖子，人工确认后才点赞
 - LLM 评论：用 OpenAI-compatible 模型筛选今日高价值话题，生成回复候选，人工确认或编辑后发布
 - Connect 状态：从 `https://connect.linux.do` 同步当前等级和升级进度提示
+- muyuan 签到：复用 LinuxDO 登录态完成 `https://muyuan.do` OAuth 登录并点击签到
 - 数据管理：支持清理账号记录和完全重置本地测试数据
 
 ## 安装
@@ -43,7 +44,7 @@ uv run linuxdo-browser tui
 TUI 主菜单包含：
 
 - 账号管理：账号列表、新增账号并登录、刷新登录、导入 Cookie
-- 浏览执行：按当前配置运行、自定义本次运行、运行所有启用账号
+- 浏览执行：按当前配置运行、自定义本次运行、运行所有启用账号、muyuan 签到
 - 审核与回复：审核今日点赞候选、生成并审核 LLM 回复
 - 浏览执行的账号选择表会显示“今日执行”和“上次执行”
 - 状态与统计：同步 Connect 状态、查看本地缓存、浏览统计、记录手动回复
@@ -118,6 +119,17 @@ uv run linuxdo-browser status --account main
 
 登录态保存在 `~/.config/linuxdo-browser/profiles/<account>/`。
 
+## muyuan 签到
+
+muyuan 使用 LinuxDO OAuth 登录，先确保对应账号已经完成 `linuxdo-browser login`：
+
+```bash
+uv run linuxdo-browser muyuan-checkin --account main
+uv run linuxdo-browser muyuan-checkin --all
+```
+
+首次执行时脚本会打开 `https://muyuan.do/login?expired=true`，勾选协议，点击 `Continue with LinuxDO`，在 LinuxDO OAuth 页面点击“允许”，随后进入个人页点击 `Check in now`。后续会复用同一个账号 profile 的登录态。
+
 ## 常用命令
 
 | 命令 | 说明 |
@@ -129,6 +141,8 @@ uv run linuxdo-browser status --account main
 | `linuxdo-browser run-all` | 顺序运行所有启用账号 |
 | `linuxdo-browser review-likes` | 审核今日点赞候选 |
 | `linuxdo-browser llm-reply` | 生成并审核 LLM 回复 |
+| `linuxdo-browser muyuan-checkin` | 为选中账号执行 muyuan 签到 |
+| `linuxdo-browser muyuan-checkin --all` | 为所有启用账号执行 muyuan 签到 |
 | `linuxdo-browser status` | 打开浏览器同步 Connect 状态并展示进度 |
 | `linuxdo-browser status --offline` | 只读取本地缓存状态 |
 | `linuxdo-browser sync-status` | 只同步 Connect 状态 |

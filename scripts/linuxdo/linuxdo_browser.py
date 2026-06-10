@@ -42,7 +42,7 @@ from sqlalchemy import select
 
 from scripts.linuxdo.linuxdo_connect import ConnectStatus, parse_connect_status
 from scripts.linuxdo.linuxdo_planner import TrustLevelPlanner
-from scripts.linuxdo.linuxdo_store import Account, AccountStore, ConnectSnapshot, RunSession
+from scripts.linuxdo.linuxdo_store import Account, AccountStore, ActivityEvent, ConnectSnapshot, RunSession
 
 console = Console()
 error_console = Console(stderr=True)
@@ -56,6 +56,10 @@ except ImportError:  # pragma: no cover - terminal editing is unavailable on som
 
 BASE_URL = 'https://linux.do'
 CONNECT_URL = 'https://connect.linux.do'
+MUYUAN_BASE_URL = 'https://muyuan.do'
+MUYUAN_LOGIN_URL = f'{MUYUAN_BASE_URL}/login?expired=true'
+MUYUAN_PERSONAL_URL = f'{MUYUAN_BASE_URL}/console/personal'
+MUYUAN_TOKEN_URL = f'{MUYUAN_BASE_URL}/console/token'
 CONFIG_DIR = Path.home() / '.config' / 'linuxdo-browser'
 LEGACY_PROFILE_DIR = CONFIG_DIR / 'profile'
 PROFILES_DIR = CONFIG_DIR / 'profiles'
@@ -144,6 +148,72 @@ VERIFY_BUTTON_SELECTORS = (
 	'button.btn-primary:has-text("Verify")',
 	'button:has-text("Verify")',
 	'button:has-text("验证")',
+)
+
+MUYUAN_AGREEMENT_TOGGLE_SCRIPT = """
+() => {
+	const input = document.querySelector('input[type="checkbox"]');
+	if (!input || input.checked) return Boolean(input?.checked);
+	const shell = input.closest('label, .semi-checkbox, [class*="checkbox"]');
+	const icon = shell?.querySelector('.semi-checkbox-inner-display, .semi-checkbox-inner');
+	(icon || input).dispatchEvent(new MouseEvent('click', { bubbles: true }));
+	return input.checked;
+}
+"""
+MUYUAN_LINUXDO_BUTTON_NAME = re.compile(r'linuxdo', re.I)
+MUYUAN_CONTINUE_SELECTORS = (
+	'button:has-text("Continue with LinuxDO")',
+	'button:has-text("使用 LinuxDO 继续")',
+	'a:has-text("Continue with LinuxDO")',
+	'a:has-text("使用 LinuxDO 继续")',
+	'button:has-text("LinuxDO")',
+	'a:has-text("LinuxDO")',
+)
+LINUXDO_OAUTH_AUTHORIZE_URL = re.compile(r'https://(?:connect\.)?linux\.do/oauth2/authorize')
+LINUXDO_OAUTH_ALLOW_NAME = re.compile(r'允许|授权|allow|authorize', re.I)
+LINUXDO_OAUTH_ALLOW_CLICK_SCRIPT = """
+() => {
+	const allowTexts = ['允许', '授权', 'allow', 'authorize'];
+	const denyTexts = ['取消', '拒绝', 'cancel', 'deny'];
+	const nodes = [
+		...document.querySelectorAll(
+			'button, input[type="submit"], a.btn, a.btn-primary, [role="button"]'
+		),
+	];
+	const matchesAllow = (el) => {
+		const text = (el.textContent || el.value || el.getAttribute('aria-label') || '').trim();
+		const lower = text.toLowerCase();
+		if (!text) return false;
+		if (denyTexts.some((token) => lower.includes(token.toLowerCase()))) return false;
+		return allowTexts.some((token) => lower.includes(token.toLowerCase()));
+	};
+	let target = nodes.find(matchesAllow);
+	if (!target) {
+		target = document.querySelector(
+			'button[name="button"][value="authorize"], input[name="button"][value="authorize"], button[value="authorize"], input[value="authorize"], button[name="authorize"]'
+		);
+	}
+	if (!target) {
+		const primaryButtons = [
+			...document.querySelectorAll('button.btn-primary, a.btn-primary, input.btn-primary'),
+		];
+		target = primaryButtons.find((el) => {
+			const text = (el.textContent || el.value || '').toLowerCase();
+			return !denyTexts.some((token) => text.includes(token.toLowerCase()));
+		});
+	}
+	if (!target) return false;
+	target.click();
+	return true;
+}
+"""
+MUYUAN_AUTHENTICATED_URL = re.compile(r'https://muyuan\.do/(?:console|oauth)')
+MUYUAN_CHECKIN_SELECTORS = (
+	'button:has-text("Check in now")',
+	'button:has-text("立即签到")',
+	'a:has-text("Check in now")',
+	'a:has-text("立即签到")',
+	'button:has-text("签到")',
 )
 
 MAX_LIKE_CANDIDATES_PER_TOPIC = 2
@@ -476,6 +546,10 @@ def page_type_from_url(url: str) -> str:
 	return 'other'
 
 
+def can_interactive_login(config: BrowserConfig) -> bool:
+	return not config.headless and sys.stdin.isatty() and sys.stdout.isatty()
+
+
 class LinuxDoBrowser:
 	def __init__(
 		self,
@@ -567,6 +641,72 @@ class LinuxDoBrowser:
 			if await self.page.locator(selector).count() > 0:
 				return True
 		return False
+
+	async def has_cloudflare_challenge(self) -> bool:
+		checks = (
+			'iframe[src*="challenges.cloudflare.com"]',
+			'iframe[src*="turnstile"]',
+			'.cf-turnstile',
+			'#cf-turnstile',
+			'text=/请验证.*真人/',
+			'text=/Verify you are human/i',
+			'text=/Checking your browser/i',
+		)
+		for selector in checks:
+			try:
+				locator = self.page.locator(selector).first
+				if await locator.count() > 0 and await locator.is_visible():
+					return True
+			except Exception:
+				continue
+		try:
+			title = (await self.page.title()).lower()
+		except PlaywrightError:
+			return False
+		return 'just a moment' in title
+
+	async def has_cloudflare_clearance(self) -> bool:
+		try:
+			return bool(
+				await self.page.evaluate(
+					"""() => document.cookie.split(';').some((part) => part.trim().startsWith('cf_clearance='))"""
+				)
+			)
+		except PlaywrightError:
+			return False
+
+	async def recover_after_cloudflare(self) -> bool:
+		if not await self.has_cloudflare_clearance():
+			return False
+		target_url = f'{BASE_URL}/login'
+		current_url = self.page.url
+		if 'challenges.cloudflare.com' in current_url or await self.has_cloudflare_challenge():
+			self.log('Cloudflare 验证已通过，正在重新打开登录页')
+			await self.page.goto(target_url, wait_until='domcontentloaded')
+		else:
+			self.log('Cloudflare 验证已通过，正在刷新页面')
+			await self.page.reload(wait_until='domcontentloaded')
+		await sleep_range((1500, 2500))
+		return True
+
+	async def watch_cloudflare_clearance(self) -> None:
+		reloaded_after_clearance = False
+		while self.running:
+			try:
+				has_challenge = await self.has_cloudflare_challenge()
+				has_clearance = await self.has_cloudflare_clearance()
+				if has_clearance and has_challenge and not reloaded_after_clearance:
+					await self.recover_after_cloudflare()
+					reloaded_after_clearance = True
+				if not has_challenge:
+					reloaded_after_clearance = False
+			except TimeoutError:
+				raise
+			except asyncio.CancelledError:
+				raise
+			except Exception:
+				pass
+			await asyncio.sleep(1.5)
 
 	async def has_human_verification_modal(self) -> bool:
 		checks = (
@@ -697,14 +837,88 @@ class LinuxDoBrowser:
 				raise
 			await asyncio.sleep(1)
 
-	async def ensure_logged_in(self) -> None:
+	async def wait_for_interactive_login(self, timeout_sec: int = 600) -> bool:
+		deadline = time.monotonic() + timeout_sec
+		console.print('[dim]完成 LinuxDO 登录后将自动继续；也可随时按 Enter 检查登录状态[/]')
+		while time.monotonic() < deadline:
+			if await self.is_logged_in():
+				console.print('[green]✓ 检测到 LinuxDO 已登录[/]')
+				return True
+			if sys.stdin.isatty():
+				ready, _, _ = select_module.select([sys.stdin], [], [], 0)
+				if ready:
+					sys.stdin.readline()
+					if await self.is_logged_in():
+						console.print('[green]✓ 检测到 LinuxDO 已登录[/]')
+						return True
+					console.print('[yellow]尚未检测到登录状态，请继续在浏览器完成登录[/]')
+			await asyncio.sleep(0.8)
+		console.print('[yellow]等待 LinuxDO 登录超时[/]')
+		return False
+
+	async def interactive_login(self) -> bool:
+		await self.page.goto(f'{BASE_URL}/login', wait_until='domcontentloaded')
+		await self.handle_human_verification()
+		if await self.has_cloudflare_clearance() and await self.has_cloudflare_challenge():
+			await self.recover_after_cloudflare()
+		if await self.is_logged_in():
+			if self.store is not None and self.account is not None:
+				self.store.update_username(self.account.id, await self.get_current_username())
+			return True
+
+		self.running = True
+		verify_task = asyncio.create_task(self.watch_human_verification())
+		cloudflare_task = asyncio.create_task(self.watch_cloudflare_clearance())
+		account_hint = f' ({self.account.name})' if self.account is not None else ''
+		console.print(
+			Panel(
+				f'请在打开的浏览器中登录 [bold]linux.do[/]{account_hint}\n'
+				'1. 若出现 Cloudflare「请验证您是真人」，点选后等待页面跳转；\n'
+				'   若未自动跳转，脚本会在验证通过后自动刷新\n'
+				'2. 若出现 Human Verification，完成 hCaptcha 后脚本会自动点 Verify\n'
+				'3. 登录完成后脚本会自动继续 muyuan 流程',
+				title='Linux.do 登录',
+				border_style='bright_blue',
+			)
+		)
+		logged_in = False
+		try:
+			logged_in = await self.wait_for_interactive_login()
+		finally:
+			self.running = False
+			cloudflare_task.cancel()
+			verify_task.cancel()
+			with contextlib.suppress(asyncio.CancelledError):
+				await cloudflare_task
+				await verify_task
+
+		if not logged_in:
+			return False
+
+		if await self.has_cloudflare_clearance() and await self.has_cloudflare_challenge():
+			await self.recover_after_cloudflare()
+		await self.handle_human_verification()
+		if await self.is_logged_in():
+			if self.store is not None and self.account is not None:
+				self.store.update_username(self.account.id, await self.get_current_username())
+			return True
+		return False
+
+	async def ensure_logged_in(self, *, interactive: bool = False) -> None:
 		await self.page.goto(f'{BASE_URL}{self.config.list_path}', wait_until='domcontentloaded')
 		await sleep_range((1500, 2500))
+		if await self.has_cloudflare_clearance() and await self.has_cloudflare_challenge():
+			await self.recover_after_cloudflare()
 		await self.handle_human_verification()
 		if await self.is_logged_in():
 			if self.store is not None and self.account is not None:
 				self.store.update_username(self.account.id, await self.get_current_username())
 			return
+
+		if interactive and can_interactive_login(self.config):
+			if await self.interactive_login():
+				return
+
 		raise RuntimeError('未检测到登录状态，请先运行: linuxdo-browser login')
 
 	async def get_current_username(self) -> str | None:
@@ -726,6 +940,234 @@ class LinuxDoBrowser:
 		if self.store is not None and self.account is not None:
 			self.store.record_connect_snapshot(self.account.id, status.to_store_payload())
 		return status
+
+	async def click_first_available(self, selectors: tuple[str, ...], timeout_ms: int = 3000) -> bool:
+		if not selectors:
+			return False
+		per_selector_timeout = max(500, timeout_ms // len(selectors))
+		for selector in selectors:
+			locator = self.page.locator(selector).first
+			try:
+				await locator.wait_for(state='visible', timeout=per_selector_timeout)
+				await locator.click(timeout=per_selector_timeout)
+				return True
+			except (PlaywrightError, PlaywrightTimeoutError):
+				continue
+		return False
+
+	async def click_muyuan_linuxdo_continue(self, timeout_ms: int = 15000) -> bool:
+		role_candidates = (
+			self.page.get_by_role('button', name=MUYUAN_LINUXDO_BUTTON_NAME),
+			self.page.get_by_role('link', name=MUYUAN_LINUXDO_BUTTON_NAME),
+		)
+		deadline = time.monotonic() + timeout_ms / 1000
+		while time.monotonic() < deadline:
+			remaining_ms = max(300, int((deadline - time.monotonic()) * 1000))
+			for locator in (*role_candidates, *(self.page.locator(selector).first for selector in MUYUAN_CONTINUE_SELECTORS)):
+				try:
+					await locator.wait_for(state='visible', timeout=min(2000, remaining_ms))
+					await locator.click(timeout=min(2000, remaining_ms))
+					return True
+				except (PlaywrightError, PlaywrightTimeoutError):
+					continue
+			await asyncio.sleep(0.25)
+		return False
+
+	async def is_muyuan_authenticated(self) -> bool:
+		await self.page.goto(MUYUAN_PERSONAL_URL, wait_until='domcontentloaded')
+		await sleep_range((1000, 1800))
+		if '/login' in self.page.url:
+			return False
+		return self.page.url.startswith(f'{MUYUAN_BASE_URL}/console/')
+
+	async def accept_muyuan_agreement(self) -> None:
+		checkbox = self.page.locator('input[type="checkbox"]').first
+		try:
+			await checkbox.wait_for(state='visible', timeout=10000)
+			if await checkbox.is_checked():
+				return
+			await checkbox.check(force=True)
+			if not await checkbox.is_checked():
+				await self.page.evaluate(MUYUAN_AGREEMENT_TOGGLE_SCRIPT)
+			await sleep_range((200, 500))
+		except (PlaywrightError, PlaywrightTimeoutError):
+			pass
+
+	def find_page_by_url(self, pattern: re.Pattern[str]) -> Page | None:
+		for candidate in self.context.pages:
+			if pattern.match(candidate.url):
+				return candidate
+		return None
+
+	def find_muyuan_authenticated_page(self) -> Page | None:
+		for candidate in self.context.pages:
+			url = candidate.url
+			if MUYUAN_AUTHENTICATED_URL.match(url) or (
+				url.startswith(MUYUAN_BASE_URL) and '/login' not in url
+			):
+				return candidate
+		return None
+
+	async def activate_page(self, page: Page) -> None:
+		self._page = page
+		with contextlib.suppress(PlaywrightError, PlaywrightTimeoutError):
+			await page.bring_to_front()
+
+	async def wait_for_oauth_authorize_page(self, timeout_ms: int = 15000) -> Page | None:
+		deadline = time.monotonic() + timeout_ms / 1000
+		while time.monotonic() < deadline:
+			oauth_page = self.find_page_by_url(LINUXDO_OAUTH_AUTHORIZE_URL)
+			if oauth_page is not None:
+				return oauth_page
+			await asyncio.sleep(0.15)
+		return None
+
+	async def try_click_linuxdo_oauth_allow_once(self, page: Page) -> bool:
+		clicked = await page.evaluate(LINUXDO_OAUTH_ALLOW_CLICK_SCRIPT)
+		if clicked:
+			return True
+
+		for locator in (
+			page.locator('button[name="button"][value="authorize"]').first,
+			page.get_by_role('button', name=LINUXDO_OAUTH_ALLOW_NAME).first,
+			page.locator('button:has-text("允许")').first,
+			page.locator('form button.btn-primary').first,
+		):
+			try:
+				if await locator.count() == 0:
+					continue
+				await locator.click(timeout=1200)
+				return True
+			except (PlaywrightError, PlaywrightTimeoutError):
+				try:
+					await locator.click(force=True, timeout=1200)
+					return True
+				except (PlaywrightError, PlaywrightTimeoutError):
+					continue
+		return False
+
+	async def click_linuxdo_oauth_allow(self, page: Page, timeout_ms: int = 8000) -> bool:
+		deadline = time.monotonic() + timeout_ms / 1000
+		ready_selector = (
+			'button[name="button"][value="authorize"], '
+			'button:has-text("允许"), form button.btn-primary'
+		)
+		while time.monotonic() < deadline:
+			if await self.try_click_linuxdo_oauth_allow_once(page):
+				return True
+			remaining_ms = max(200, int((deadline - time.monotonic()) * 1000))
+			with contextlib.suppress(PlaywrightError, PlaywrightTimeoutError):
+				await page.wait_for_selector(ready_selector, timeout=min(800, remaining_ms))
+			await asyncio.sleep(0.15)
+		return False
+
+	async def wait_for_oauth_authorize_redirect(self, page: Page, timeout_ms: int = 12000) -> None:
+		with contextlib.suppress(PlaywrightError, PlaywrightTimeoutError):
+			await page.wait_for_function(
+				"() => !/oauth2\\/authorize/.test(location.href)",
+				timeout=timeout_ms,
+			)
+
+	async def wait_for_muyuan_oauth_finish(self, timeout_ms: int = 15000) -> bool:
+		deadline = time.monotonic() + timeout_ms / 1000
+		while time.monotonic() < deadline:
+			muyuan_page = self.find_muyuan_authenticated_page()
+			if muyuan_page is not None:
+				await self.activate_page(muyuan_page)
+				return True
+			await asyncio.sleep(0.2)
+		return False
+
+	async def close_extra_oauth_pages(self) -> None:
+		for candidate in list(self.context.pages):
+			if candidate is self.page:
+				continue
+			if LINUXDO_OAUTH_AUTHORIZE_URL.match(candidate.url):
+				with contextlib.suppress(PlaywrightError, PlaywrightTimeoutError):
+					await candidate.close()
+
+	async def complete_linuxdo_oauth_for_muyuan(self, timeout_ms: int = 30000) -> None:
+		deadline = time.monotonic() + timeout_ms / 1000
+		oauth_click_attempts = 0
+		while time.monotonic() < deadline:
+			muyuan_page = self.find_muyuan_authenticated_page()
+			if muyuan_page is not None:
+				await self.activate_page(muyuan_page)
+				await self.close_extra_oauth_pages()
+				return
+
+			oauth_page = self.find_page_by_url(LINUXDO_OAUTH_AUTHORIZE_URL)
+			if oauth_page is not None:
+				await self.activate_page(oauth_page)
+				if oauth_click_attempts == 0:
+					self.log('确认 LinuxDO OAuth 授权')
+				if await self.click_linuxdo_oauth_allow(oauth_page):
+					oauth_click_attempts = 0
+					await self.wait_for_oauth_authorize_redirect(oauth_page)
+					if await self.wait_for_muyuan_oauth_finish():
+						await self.close_extra_oauth_pages()
+						return
+					continue
+				oauth_click_attempts += 1
+				if oauth_click_attempts >= 5:
+					raise RuntimeError(
+						'LinuxDO OAuth 页面未能自动点击允许按钮，请手动点击后重试'
+					)
+				await asyncio.sleep(0.25)
+				continue
+
+			for candidate in self.context.pages:
+				url = candidate.url
+				if url.startswith(f'{BASE_URL}/login'):
+					if can_interactive_login(self.config):
+						await self.activate_page(candidate)
+						self.log('LinuxDO 需要登录，请在浏览器中完成登录')
+						if await self.interactive_login():
+							break
+					raise RuntimeError(
+						'LinuxDO 未登录或会话已过期，无法完成 muyuan OAuth。'
+						f'请先运行: linuxdo-browser login --account {self.account.slug if self.account else "<账号>"}'
+					)
+			await asyncio.sleep(0.2)
+
+	async def authorize_muyuan_with_linuxdo(self) -> None:
+		await self.ensure_logged_in(interactive=can_interactive_login(self.config))
+		if await self.is_muyuan_authenticated():
+			self.log('muyuan 已登录')
+			return
+
+		self.log('打开 muyuan 登录页')
+		await self.page.goto(MUYUAN_LOGIN_URL, wait_until='domcontentloaded')
+		await self.accept_muyuan_agreement()
+		if not await self.click_muyuan_linuxdo_continue():
+			raise RuntimeError('muyuan 登录页未找到 LinuxDO 登录按钮')
+
+		oauth_page = await self.wait_for_oauth_authorize_page(timeout_ms=12000)
+		if oauth_page is not None:
+			await self.activate_page(oauth_page)
+		with contextlib.suppress(PlaywrightError, PlaywrightTimeoutError):
+			await self.page.wait_for_load_state('domcontentloaded')
+		await self.complete_linuxdo_oauth_for_muyuan()
+
+		if not await self.is_muyuan_authenticated():
+			raise RuntimeError(
+				f'muyuan 登录未完成（当前页面: {self.page.url}）。'
+				'请确认 LinuxDO 已登录且 OAuth 已允许'
+			)
+		self.log('muyuan 登录完成')
+
+	async def muyuan_checkin(self) -> bool:
+		await self.authorize_muyuan_with_linuxdo()
+		await self.page.goto(MUYUAN_PERSONAL_URL, wait_until='domcontentloaded')
+		await sleep_range((1200, 2000))
+
+		if not await self.click_first_available(MUYUAN_CHECKIN_SELECTORS, timeout_ms=1500):
+			self.log('muyuan 未找到 Check in now，可能今天已签到')
+			return False
+
+		self.log('点击 muyuan Check in now')
+		await sleep_range((1500, 2500))
+		return True
 
 	async def get_csrf_token(self) -> str:
 		token = await self.page.locator('meta[name="csrf-token"]').get_attribute('content')
@@ -1381,7 +1823,7 @@ class LinuxDoBrowser:
 	async def run(self) -> None:
 		self.running = True
 		self.heartbeat()
-		await self.ensure_logged_in()
+		await self.ensure_logged_in(interactive=can_interactive_login(self.config))
 		verify_task = asyncio.create_task(self.watch_human_verification())
 
 		try:
@@ -1491,6 +1933,10 @@ def build_parser() -> argparse.ArgumentParser:
 	sync_parser = subparsers.add_parser('sync-status', help='Sync status from connect.linux.do')
 	sync_parser.add_argument('--account', help='Account name or slug')
 	sync_parser.add_argument('--headless', action='store_true', help='Run browser headless')
+	muyuan_parser = subparsers.add_parser('muyuan-checkin', help='Check in on muyuan.do through LinuxDO OAuth')
+	muyuan_parser.add_argument('--account', help='Account name or slug')
+	muyuan_parser.add_argument('--all', action='store_true', help='Check in all enabled accounts')
+	muyuan_parser.add_argument('--headless', action='store_true', help='Run browser headless')
 	review_likes_parser = subparsers.add_parser('review-likes', help='Review like candidates from browsed topics')
 	review_likes_parser.add_argument('--account', help='Account name or slug')
 	review_likes_parser.add_argument('--headless', action='store_true', help='Run browser headless')
@@ -1947,30 +2393,8 @@ async def cmd_login(args: argparse.Namespace) -> int:
 
 	async with async_playwright() as playwright:
 		try:
-			page = await browser.launch(playwright)
-			await page.goto(f'{BASE_URL}/latest', wait_until='domcontentloaded')
-			await browser.handle_human_verification()
-			browser.running = True
-			verify_task = asyncio.create_task(browser.watch_human_verification())
-			console.print(
-				Panel(
-					'请在打开的浏览器中登录 [bold]linux.do[/]\n'
-					'若出现 Human Verification，完成 hCaptcha 后脚本会自动点 Verify\n'
-					'登录完成后回到终端，按 Enter 保存 session',
-					title='Linux.do 登录',
-					border_style='bright_blue',
-				)
-			)
-			try:
-				await asyncio.to_thread(tui_pause, '按 Enter 保存 session')
-			finally:
-				browser.running = False
-				verify_task.cancel()
-				with contextlib.suppress(asyncio.CancelledError):
-					await verify_task
-			await browser.handle_human_verification()
-			if await browser.is_logged_in():
-				store.update_username(account.id, await browser.get_current_username())
+			await browser.launch(playwright)
+			if await browser.interactive_login():
 				console.print('[green]✓ 登录状态已保存[/]')
 			else:
 				console.print('[yellow]未检测到登录元素，session 仍会保存，运行 run 时再验证[/]')
@@ -2347,6 +2771,55 @@ async def cmd_sync_status(args: argparse.Namespace) -> int:
 	return 0
 
 
+async def muyuan_checkin_for_account(config: BrowserConfig, store: AccountStore, account: Account) -> bool:
+	browser = build_browser_for_account(config, store, account)
+	async with async_playwright() as playwright:
+		try:
+			await browser.launch(playwright)
+			checked_in = await browser.muyuan_checkin()
+			if checked_in:
+				store.record_event(account.id, 'muyuan_checkin')
+			return checked_in
+		finally:
+			await browser.close()
+
+
+async def cmd_muyuan_checkin(args: argparse.Namespace) -> int:
+	config = load_config()
+	if getattr(args, 'headless', False):
+		config.headless = True
+	store = get_store()
+	accounts = (
+		[account for account in store.list_accounts() if account.enabled]
+		if getattr(args, 'all', False)
+		else [resolve_account(store, getattr(args, 'account', None))]
+	)
+	if not accounts:
+		error_console.print('[bold red]没有可签到的账号，请先执行 accounts add[/]')
+		return 1
+
+	exit_code = 0
+	for account in accounts:
+		console.print(f'[cyan]muyuan[/] 账号: {account.name}')
+		try:
+			checked_in = await muyuan_checkin_for_account(config, store, account)
+		except RuntimeError as exc:
+			exit_code = 1
+			error_console.print(f'[bold red]ERROR:[/] {exc}')
+		except TimeoutError as exc:
+			exit_code = 1
+			error_console.print(f'[bold red]TIMEOUT:[/] {exc}')
+		except PlaywrightError as exc:
+			exit_code = 1
+			error_console.print(f'[bold red]PLAYWRIGHT:[/] {exc}')
+		else:
+			if checked_in:
+				console.print(f'[green]✓ muyuan 签到完成:[/] {account.name}')
+			else:
+				console.print(f'[yellow]muyuan 未执行签到，可能今天已签到:[/] {account.name}')
+	return exit_code
+
+
 def cmd_reply(args: argparse.Namespace) -> int:
 	if (args.reply_command or 'mark') != 'mark':
 		error_console.print(f'[bold red]未知 reply 命令:[/] {args.reply_command}')
@@ -2439,7 +2912,8 @@ def tui_pause(message: str = '按 Enter 返回') -> None:
 
 def tui_clear_screen() -> None:
 	if console.is_terminal:
-		console.clear()
+		sys.stdout.write('\x1b[2J\x1b[H')
+		sys.stdout.flush()
 
 
 def tui_keyboard_selection_available() -> bool:
@@ -2488,6 +2962,7 @@ def tui_args(command: str, **overrides: Any) -> argparse.Namespace:
 		'cookies': None,
 		'file': None,
 		'skip_run_today': False,
+		'all': False,
 	}
 	defaults.update(overrides)
 	return argparse.Namespace(**defaults)
@@ -2513,18 +2988,22 @@ def tui_prompt_choice(
 	old_settings = termios.tcgetattr(fd)  # type: ignore[union-attr]
 
 	def redraw() -> None:
+		# Rich layout/clear needs cooked terminal mode; raw mode breaks cursor position.
+		termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)  # type: ignore[union-attr]
 		if clear_screen:
 			tui_clear_screen()
 		render(keys[selected_index])
 		console.print('[dim]↑/↓ 选择，Enter 确认；数字直选，0/q 返回[/]')
+		sys.stdout.flush()
+		tty.setraw(fd)  # type: ignore[union-attr]
 
 	def finish(choice: str) -> str:
+		termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)  # type: ignore[union-attr]
 		sys.stdout.write('\n')
 		sys.stdout.flush()
 		return choice
 
 	try:
-		tty.setraw(fd)  # type: ignore[union-attr]
 		decoder = codecs.getincrementaldecoder('utf-8')('ignore')
 		redraw()
 		while True:
@@ -2638,11 +3117,38 @@ def account_run_statuses(store: AccountStore, accounts: list[Account]) -> dict[i
 	return statuses
 
 
+def account_muyuan_checkin_statuses(store: AccountStore, accounts: list[Account]) -> dict[int, tuple[bool, str]]:
+	account_ids = [account.id for account in accounts]
+	statuses = {account.id: (False, '-') for account in accounts}
+	if not account_ids:
+		return statuses
+	today = datetime.now().astimezone().date()
+	with store.session() as session:
+		events = list(
+			session.scalars(
+				select(ActivityEvent)
+				.where(
+					ActivityEvent.account_id.in_(account_ids),
+					ActivityEvent.event_type == 'muyuan_checkin',
+				)
+				.order_by(ActivityEvent.created_at.desc(), ActivityEvent.id.desc())
+			).all()
+		)
+	for event in events:
+		has_checked_in_today, last_checkin = statuses.get(event.account_id, (False, '-'))
+		if last_checkin == '-':
+			last_checkin = format_local_datetime(event.created_at)
+		has_checked_in_today = has_checked_in_today or local_date_from_datetime(event.created_at) == today
+		statuses[event.account_id] = (has_checked_in_today, last_checkin)
+	return statuses
+
+
 def tui_select_account(
 	store: AccountStore,
 	title: str = '选择账号',
 	allow_cancel: bool = True,
 	show_run_status: bool = False,
+	show_muyuan_status: bool = False,
 	show_llm_candidates: bool = False,
 	clear_screen: bool = True,
 ) -> str | None:
@@ -2650,6 +3156,7 @@ def tui_select_account(
 	if not accounts:
 		accounts = [store.get_or_create_default_account()]
 	run_statuses = account_run_statuses(store, accounts) if show_run_status else {}
+	muyuan_statuses = account_muyuan_checkin_statuses(store, accounts) if show_muyuan_status else {}
 	llm_counts = llm_candidate_counts(store, accounts) if show_llm_candidates else {}
 
 	choices = [str(index) for index in range(1, len(accounts) + 1)]
@@ -2665,6 +3172,9 @@ def tui_select_account(
 		table.add_column('目标等级', justify='right')
 		if show_llm_candidates:
 			table.add_column('LLM候选', justify='right')
+		if show_muyuan_status:
+			table.add_column('今日签到', justify='center')
+			table.add_column('上次签到', no_wrap=True)
 		if show_run_status:
 			table.add_column('今日执行', justify='center')
 			table.add_column('上次执行', no_wrap=True)
@@ -2679,6 +3189,9 @@ def tui_select_account(
 			]
 			if show_llm_candidates:
 				row.append(str(llm_counts.get(account.id, 0)))
+			if show_muyuan_status:
+				has_checked_in_today, last_checkin = muyuan_statuses[account.id]
+				row.extend([Text('🟢') if has_checked_in_today else Text('', style='dim'), last_checkin])
 			if show_run_status:
 				has_run_today, last_run = run_statuses[account.id]
 				row.extend([Text('🟢') if has_run_today else Text('', style='dim'), last_run])
@@ -2687,6 +3200,8 @@ def tui_select_account(
 			row = [tui_selected_key_cell('0', selected_key), '返回', '-', '-', '-']
 			if show_llm_candidates:
 				row.append('-')
+			if show_muyuan_status:
+				row.extend(['-', '-'])
 			if show_run_status:
 				row.extend(['-', '-'])
 			table.add_row(*row, style=tui_selected_row_style('0', selected_key))
@@ -2824,6 +3339,7 @@ async def tui_browse_menu() -> None:
 				('4', '运行所有启用账号（自定义本次运行）'),
 				('5', '审核今日点赞候选'),
 				('6', '生成并审核 LLM 回复'),
+				('7', 'muyuan 签到'),
 				('0', '返回主菜单'),
 			],
 		)
@@ -2860,6 +3376,17 @@ async def tui_browse_menu() -> None:
 				config = load_config()
 				count = tui_prompt_int('筛选话题数 N', config.llm_topic_count, 1)
 				await cmd_llm_reply(tui_args('llm-reply', account=account, count=count))
+				tui_pause()
+		elif choice == '7':
+			if Confirm.ask('为所有启用账号执行 muyuan 签到？', default=True):
+				await cmd_muyuan_checkin(tui_args('muyuan-checkin', all=True))
+				tui_pause()
+				continue
+			store = get_store()
+			tui_clear_screen()
+			account = tui_select_account(store, title='选择 muyuan 签到账号', show_muyuan_status=True)
+			if account is not None:
+				await cmd_muyuan_checkin(tui_args('muyuan-checkin', account=account))
 				tui_pause()
 
 
@@ -3002,6 +3529,8 @@ async def async_main(args: argparse.Namespace) -> int:
 		return await cmd_status(args)
 	if command == 'sync-status':
 		return await cmd_sync_status(args)
+	if command == 'muyuan-checkin':
+		return await cmd_muyuan_checkin(args)
 	if command == 'review-likes':
 		return await cmd_review_likes(args)
 	if command == 'llm-reply':
