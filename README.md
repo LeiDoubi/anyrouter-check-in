@@ -23,7 +23,7 @@
 - ✅ 绕过 WAF 限制
 - ✅ 本地账号管理：一条命令查看各账号余额，并为 Claude Code / Codex 切换 `auth_token`
 - ✅ 一键同步：把本地 `.accounts.json` 与通知配置推送到 GitHub Actions Secrets（自动从 session 提取 `api_user`）
-- ✅ Linux.do 自动浏览：Playwright 模拟浏览帖子、随机点赞（[`linuxdo-browser`](docs/linuxdo-browser.md)）
+- ✅ Linux.do 自动浏览：CloakBrowser stealth Chromium 模拟浏览帖子、随机点赞（[`linuxdo-browser`](docs/linuxdo-browser.md)）
 
 ## 使用方法
 
@@ -238,15 +238,14 @@ uv run python scripts/push_accounts_secret.py --write
 
 ## Linux.do 自动浏览
 
-基于 Playwright 的 [linux.do](https://linux.do) 论坛自动浏览工具（Tampermonkey 用户脚本的 Python 版）。自动滚动列表、阅读未看话题、按话题节奏点赞，登录态保存在本地。
+基于 CloakBrowser stealth Chromium 的 [linux.do](https://linux.do) 论坛自动浏览工具（Tampermonkey 用户脚本的 Python 版）。自动滚动列表、阅读未看话题、按话题节奏点赞，登录态保存在本地。
 
 **完整文档见：[docs/linuxdo-browser.md](docs/linuxdo-browser.md)**
 
 ```bash
-# 安装 Playwright 浏览器（Chrome 不可用时的回退；推荐本机安装 Google Chrome）
-uv run playwright install chromium
+uv sync
 
-# 首次：浏览器登录
+# 首次：浏览器登录（会自动下载 CloakBrowser Chromium 二进制）
 uv run linuxdo-browser login
 
 # 打开交互式 TUI
@@ -266,7 +265,7 @@ uv run linuxdo-browser stats
 uv run linuxdo-browser clear
 ```
 
-数据目录：`~/.config/linuxdo-browser/`（配置、浏览历史、浏览器 profile）。
+数据目录：`~/.config/linuxdo-browser/`（配置、浏览历史、CloakBrowser profile）。
 
 ## 执行时间
 

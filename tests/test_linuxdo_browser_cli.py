@@ -341,8 +341,8 @@ async def test_muyuan_checkin_records_success_and_closes_browser(tmp_path, monke
 	class FakeBrowser:
 		closed = False
 
-		async def launch(self, playwright):
-			self.playwright = playwright
+		async def launch(self):
+			self.launched = True
 
 		async def muyuan_checkin(self):
 			return True
@@ -350,17 +350,9 @@ async def test_muyuan_checkin_records_success_and_closes_browser(tmp_path, monke
 		async def close(self):
 			self.closed = True
 
-	class FakePlaywright:
-		async def __aenter__(self):
-			return object()
-
-		async def __aexit__(self, exc_type, exc, tb):
-			return False
-
 	fake_browser = FakeBrowser()
 
 	monkeypatch.setattr(linuxdo_browser, 'build_browser_for_account', lambda config, store, account: fake_browser)
-	monkeypatch.setattr(linuxdo_browser, 'async_playwright', lambda: FakePlaywright())
 
 	result = await linuxdo_browser.muyuan_checkin_for_account(BrowserConfig(), store, account)
 
@@ -530,7 +522,7 @@ async def test_sync_status_closes_browser_on_error(monkeypatch):
 	class FakeBrowser:
 		closed = False
 
-		async def launch(self, playwright):
+		async def launch(self):
 			return None
 
 		async def sync_connect_status(self):
@@ -539,17 +531,9 @@ async def test_sync_status_closes_browser_on_error(monkeypatch):
 		async def close(self):
 			self.closed = True
 
-	class FakePlaywright:
-		async def __aenter__(self):
-			return object()
-
-		async def __aexit__(self, exc_type, exc, tb):
-			return False
-
 	fake_browser = FakeBrowser()
 
 	monkeypatch.setattr(linuxdo_browser, 'build_browser_for_account', lambda config, store, account: fake_browser)
-	monkeypatch.setattr(linuxdo_browser, 'async_playwright', lambda: FakePlaywright())
 
 	with pytest.raises(RuntimeError, match='boom'):
 		await sync_status_for_account(BrowserConfig(), object(), object())

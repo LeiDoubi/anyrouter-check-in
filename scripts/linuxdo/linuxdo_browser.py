@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Linux.do auto browsing helper powered by Playwright.
+Linux.do auto browsing helper powered by CloakBrowser.
 
 Port of the Tampermonkey "Linux.do 自动浏览助手" userscript.
 """
@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import codecs
 import contextlib
+import hashlib
 import json
 import os
 import platform
@@ -26,9 +27,10 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urljoin
 
+from cloakbrowser import launch_persistent_context_async
 from dotenv import load_dotenv
 from openai import OpenAI
-from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
+from playwright.async_api import BrowserContext, Page
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from rich.cells import cell_len
@@ -126,21 +128,15 @@ SPEED_VARIATION_PROFILES = (
 	{'name': '慢', 'weight': 2, 'delay_factor': 1.15, 'scroll_factor': 0.90},
 )
 
-LAUNCH_ARGS = [
-	'--disable-blink-features=AutomationControlled',
+CLOAK_PROFILE_SUBDIR = 'cloak'
+CLOAK_VIEWPORT = {'width': 1360, 'height': 900}
+CLOAK_LAUNCH_ARGS = [
 	*(
-		['--disable-dev-shm-usage', '--no-sandbox']
+		['--disable-dev-shm-usage']
 		if platform.system() == 'Linux'
 		else []
 	),
 ]
-
-STEALTH_INIT_SCRIPT = """
-(() => {
-	Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-	window.chrome = window.chrome || { runtime: {} };
-})();
-"""
 
 VERIFY_BUTTON_SELECTORS = (
 	'.d-modal button.btn-primary:has-text("Verify")',
@@ -550,6 +546,15 @@ def can_interactive_login(config: BrowserConfig) -> bool:
 	return not config.headless and sys.stdin.isatty() and sys.stdout.isatty()
 
 
+def cloak_fingerprint_seed(account: Account | None, profile_dir: Path) -> int:
+	if account is not None:
+		source = f'{account.id}:{account.slug}:{account.name}'
+	else:
+		source = str(profile_dir)
+	digest = hashlib.sha256(f'linuxdo-browser:{source}'.encode('utf-8')).hexdigest()
+	return 10000 + (int(digest[:8], 16) % 90000)
+
+
 class LinuxDoBrowser:
 	def __init__(
 		self,
@@ -574,8 +579,8 @@ class LinuxDoBrowser:
 	@property
 	def profile_dir(self) -> Path:
 		if self.account is not None:
-			return Path(self.account.profile_dir)
-		return LEGACY_PROFILE_DIR
+			return Path(self.account.profile_dir) / CLOAK_PROFILE_SUBDIR
+		return LEGACY_PROFILE_DIR / CLOAK_PROFILE_SUBDIR
 
 	def heartbeat(self) -> None:
 		self.last_activity = time.monotonic()
@@ -583,31 +588,18 @@ class LinuxDoBrowser:
 	def log(self, message: str) -> None:
 		console.log(f'[cyan]linuxdo[/] {message}')
 
-	async def launch(self, playwright: Playwright) -> Page:
+	async def launch(self) -> Page:
 		self.profile_dir.mkdir(parents=True, exist_ok=True)
-		context_kwargs: dict[str, Any] = {
-			'user_data_dir': str(self.profile_dir),
-			'headless': self.config.headless,
-			'viewport': {'width': 1360, 'height': 900},
-			'locale': 'zh-CN',
-			'args': LAUNCH_ARGS,
-			'ignore_default_args': ['--enable-automation'],
-		}
-
-		if self.config.use_chrome:
-			try:
-				self._context = await playwright.chromium.launch_persistent_context(
-					channel='chrome',
-					**context_kwargs,
-				)
-				self.log('使用系统 Chrome 启动（hCaptcha 兼容性更好）')
-			except Exception as exc:
-				console.print(f'[yellow]无法启动 Chrome ({exc})，回退到 Chromium[/]')
-				self._context = await playwright.chromium.launch_persistent_context(**context_kwargs)
-		else:
-			self._context = await playwright.chromium.launch_persistent_context(**context_kwargs)
-
-		await self._context.add_init_script(STEALTH_INIT_SCRIPT)
+		fingerprint_seed = cloak_fingerprint_seed(self.account, self.profile_dir)
+		self._context = await launch_persistent_context_async(
+			self.profile_dir,
+			headless=self.config.headless,
+			viewport=CLOAK_VIEWPORT,
+			locale='zh-CN',
+			args=[*CLOAK_LAUNCH_ARGS, f'--fingerprint={fingerprint_seed}'],
+			humanize=True,
+		)
+		self.log(f'使用 CloakBrowser stealth Chromium 启动（profile: {self.profile_dir}）')
 		self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
 		return self._page
 
@@ -755,7 +747,7 @@ class LinuxDoBrowser:
 				continue
 			try:
 				if await button.is_enabled():
-					await button.click(timeout=2000)
+					await button.click(timeout=5000)
 					return True
 			except Exception:
 				pass
@@ -949,7 +941,7 @@ class LinuxDoBrowser:
 			locator = self.page.locator(selector).first
 			try:
 				await locator.wait_for(state='visible', timeout=per_selector_timeout)
-				await locator.click(timeout=per_selector_timeout)
+				await locator.click(timeout=max(3000, per_selector_timeout))
 				return True
 			except (PlaywrightError, PlaywrightTimeoutError):
 				continue
@@ -963,10 +955,13 @@ class LinuxDoBrowser:
 		deadline = time.monotonic() + timeout_ms / 1000
 		while time.monotonic() < deadline:
 			remaining_ms = max(300, int((deadline - time.monotonic()) * 1000))
-			for locator in (*role_candidates, *(self.page.locator(selector).first for selector in MUYUAN_CONTINUE_SELECTORS)):
+			for locator in (
+				*role_candidates,
+				*(self.page.locator(selector).first for selector in MUYUAN_CONTINUE_SELECTORS),
+			):
 				try:
 					await locator.wait_for(state='visible', timeout=min(2000, remaining_ms))
-					await locator.click(timeout=min(2000, remaining_ms))
+					await locator.click(timeout=min(5000, remaining_ms))
 					return True
 				except (PlaywrightError, PlaywrightTimeoutError):
 					continue
@@ -1036,11 +1031,11 @@ class LinuxDoBrowser:
 			try:
 				if await locator.count() == 0:
 					continue
-				await locator.click(timeout=1200)
+				await locator.click(timeout=5000)
 				return True
 			except (PlaywrightError, PlaywrightTimeoutError):
 				try:
-					await locator.click(force=True, timeout=1200)
+					await locator.click(force=True, timeout=5000)
 					return True
 				except (PlaywrightError, PlaywrightTimeoutError):
 					continue
@@ -1271,7 +1266,7 @@ class LinuxDoBrowser:
 		try:
 			await like_btn.first.scroll_into_view_if_needed()
 			await sleep_range((100, 300))
-			await like_btn.first.click(timeout=3000)
+			await like_btn.first.click(timeout=6000)
 			await sleep_range((400, 800))
 			class_name = await like_btn.first.get_attribute('class') or ''
 			if any(flag in class_name for flag in ('has-like', 'my-likes', 'liked')):
@@ -1878,7 +1873,7 @@ class LinuxDoBrowser:
 
 
 def build_parser() -> argparse.ArgumentParser:
-	parser = argparse.ArgumentParser(description='Linux.do auto browsing helper (Playwright)')
+	parser = argparse.ArgumentParser(description='Linux.do auto browsing helper (CloakBrowser)')
 	subparsers = parser.add_subparsers(dest='command')
 
 	accounts_parser = subparsers.add_parser('accounts', help='Manage Linux.do accounts')
@@ -2063,12 +2058,11 @@ def latest_metrics(store: AccountStore, account: Account) -> dict[str, Any]:
 
 async def sync_status_for_account(config: BrowserConfig, store: AccountStore, account: Account) -> ConnectStatus:
 	browser = build_browser_for_account(config, store, account)
-	async with async_playwright() as playwright:
-		try:
-			await browser.launch(playwright)
-			return await browser.sync_connect_status()
-		finally:
-			await browser.close()
+	try:
+		await browser.launch()
+		return await browser.sync_connect_status()
+	finally:
+		await browser.close()
 
 
 async def try_sync_status_for_account(config: BrowserConfig, store: AccountStore, account: Account) -> bool:
@@ -2391,15 +2385,14 @@ async def cmd_login(args: argparse.Namespace) -> int:
 	account = resolve_account(store, getattr(args, 'account', None))
 	browser = build_browser_for_account(config, store, account)
 
-	async with async_playwright() as playwright:
-		try:
-			await browser.launch(playwright)
-			if await browser.interactive_login():
-				console.print('[green]✓ 登录状态已保存[/]')
-			else:
-				console.print('[yellow]未检测到登录元素，session 仍会保存，运行 run 时再验证[/]')
-		finally:
-			await browser.close()
+	try:
+		await browser.launch()
+		if await browser.interactive_login():
+			console.print('[green]✓ 登录状态已保存[/]')
+		else:
+			console.print('[yellow]未检测到登录元素，session 仍会保存，运行 run 时再验证[/]')
+	finally:
+		await browser.close()
 	return 0
 
 
@@ -2435,19 +2428,18 @@ async def cmd_import_cookies(args: argparse.Namespace) -> int:
 	store = get_store()
 	account = resolve_account(store, getattr(args, 'account', None))
 	browser = build_browser_for_account(config, store, account)
-	async with async_playwright() as playwright:
-		try:
-			await browser.launch(playwright)
-			await browser.context.add_cookies(cast(Any, cookies))
-			await browser.page.goto(f'{BASE_URL}/latest', wait_until='domcontentloaded')
-			await browser.handle_human_verification()
-			if await browser.is_logged_in():
-				store.update_username(account.id, await browser.get_current_username())
-				console.print(f'[green]✓ 已导入 {len(cookies)} 个 Cookie 并验证登录成功[/]')
-			else:
-				console.print(f'[yellow]已导入 {len(cookies)} 个 Cookie，但未检测到登录状态，Cookie 可能已过期[/]')
-		finally:
-			await browser.close()
+	try:
+		await browser.launch()
+		await browser.context.add_cookies(cast(Any, cookies))
+		await browser.page.goto(f'{BASE_URL}/latest', wait_until='domcontentloaded')
+		await browser.handle_human_verification()
+		if await browser.is_logged_in():
+			store.update_username(account.id, await browser.get_current_username())
+			console.print(f'[green]✓ 已导入 {len(cookies)} 个 Cookie 并验证登录成功[/]')
+		else:
+			console.print(f'[yellow]已导入 {len(cookies)} 个 Cookie，但未检测到登录状态，Cookie 可能已过期[/]')
+	finally:
+		await browser.close()
 	return 0
 
 
@@ -2458,13 +2450,12 @@ async def cmd_review_likes(args: argparse.Namespace) -> int:
 	store = get_store()
 	account = resolve_account(store, getattr(args, 'account', None))
 	browser = build_browser_for_account(config, store, account)
-	async with async_playwright() as playwright:
-		try:
-			await browser.launch(playwright)
-			await browser.ensure_logged_in()
-			await review_like_candidates(browser, store, account)
-		finally:
-			await browser.close()
+	try:
+		await browser.launch()
+		await browser.ensure_logged_in()
+		await review_like_candidates(browser, store, account)
+	finally:
+		await browser.close()
 	return 0
 
 
@@ -2538,26 +2529,25 @@ async def cmd_llm_reply(args: argparse.Namespace) -> int:
 		return 0
 
 	browser = build_browser_for_account(config, store, account)
-	async with async_playwright() as playwright:
-		try:
-			with llm_progress() as progress:
-				task = progress.add_task('启动浏览器并发布回复', total=len(approved_replies) + 1)
-				await browser.launch(playwright)
-				await browser.ensure_logged_in()
+	try:
+		with llm_progress() as progress:
+			task = progress.add_task('启动浏览器并发布回复', total=len(approved_replies) + 1)
+			await browser.launch()
+			await browser.ensure_logged_in()
+			progress.advance(task)
+			for topic, reply in approved_replies:
+				progress.update(task, description=f'发布回复: {topic["title"][:32]}')
+				await browser.page.goto(topic['url'] or f'{BASE_URL}/t/topic/{topic["topic_id"]}/1', wait_until='domcontentloaded')
+				await browser.handle_human_verification()
+				result = await browser.send_reply(topic['topic_id'], reply)
+				if result.get('success'):
+					store.record_event(account.id, 'llm_reply', topic_id=topic['topic_id'], post_id=result.get('post_id'))
+					progress.console.print(f'[green]已发布回复:[/] {topic["title"]}')
+				else:
+					progress.console.print(f'[yellow]回复失败 {topic["topic_id"]}:[/] {result.get("error")}')
 				progress.advance(task)
-				for topic, reply in approved_replies:
-					progress.update(task, description=f'发布回复: {topic["title"][:32]}')
-					await browser.page.goto(topic['url'] or f'{BASE_URL}/t/topic/{topic["topic_id"]}/1', wait_until='domcontentloaded')
-					await browser.handle_human_verification()
-					result = await browser.send_reply(topic['topic_id'], reply)
-					if result.get('success'):
-						store.record_event(account.id, 'llm_reply', topic_id=topic['topic_id'], post_id=result.get('post_id'))
-						progress.console.print(f'[green]已发布回复:[/] {topic["title"]}')
-					else:
-						progress.console.print(f'[yellow]回复失败 {topic["topic_id"]}:[/] {result.get("error")}')
-					progress.advance(task)
-		finally:
-			await browser.close()
+	finally:
+		await browser.close()
 	cmd_status_for_account(store, account)
 	return 0
 
@@ -2585,13 +2575,12 @@ async def cmd_run(args: argparse.Namespace) -> int:
 	)
 
 	try:
-		async with async_playwright() as playwright:
-			try:
-				await browser.launch(playwright)
-				await browser.run()
-				await review_like_candidates(browser, store, account)
-			finally:
-				await browser.close()
+		try:
+			await browser.launch()
+			await browser.run()
+			await review_like_candidates(browser, store, account)
+		finally:
+			await browser.close()
 	except KeyboardInterrupt:
 		browser.stop()
 		store.finish_run(
@@ -2773,15 +2762,14 @@ async def cmd_sync_status(args: argparse.Namespace) -> int:
 
 async def muyuan_checkin_for_account(config: BrowserConfig, store: AccountStore, account: Account) -> bool:
 	browser = build_browser_for_account(config, store, account)
-	async with async_playwright() as playwright:
-		try:
-			await browser.launch(playwright)
-			checked_in = await browser.muyuan_checkin()
-			if checked_in:
-				store.record_event(account.id, 'muyuan_checkin')
-			return checked_in
-		finally:
-			await browser.close()
+	try:
+		await browser.launch()
+		checked_in = await browser.muyuan_checkin()
+		if checked_in:
+			store.record_event(account.id, 'muyuan_checkin')
+		return checked_in
+	finally:
+		await browser.close()
 
 
 async def cmd_muyuan_checkin(args: argparse.Namespace) -> int:

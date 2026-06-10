@@ -1,8 +1,8 @@
-# Linux.do Playwright 测试助手
+# Linux.do CloakBrowser 测试助手
 
-基于 Playwright 的 Linux.do 论坛流程测试工具，用于自有论坛环境中验证登录、浏览话题、帖子阅读记录、点赞上限、草稿/升级进度等后台逻辑是否正常。
+基于 CloakBrowser stealth Chromium 的 Linux.do 论坛流程测试工具，用于自有论坛环境中验证登录、浏览话题、帖子阅读记录、点赞上限、草稿/升级进度等后台逻辑是否正常。
 
-工具使用真实浏览器 profile，不新增验证码绕过逻辑；若测试环境启用了验证码，需要人工完成后再继续。
+工具使用 CloakBrowser 持久 profile 和人类化输入/滚动；若测试环境仍触发验证码，需要人工完成后再继续。
 
 ## 功能
 
@@ -21,11 +21,10 @@
 
 ```bash
 uv sync
-uv run playwright install chromium
 uv run linuxdo-browser --help
 ```
 
-推荐本机安装 Google Chrome。脚本默认优先启动系统 Chrome，失败时回退到 Playwright Chromium。
+CloakBrowser 首次启动会自动下载定制 Chromium 二进制（约 200MB），缓存到本机。
 
 ## 交互式 TUI
 
@@ -57,7 +56,6 @@ TUI 主菜单包含：
 
 ```bash
 uv sync
-uv run playwright install chromium
 uv run linuxdo-browser --help
 ```
 
@@ -67,7 +65,7 @@ uv run linuxdo-browser --help
 uv run linuxdo-browser accounts add main --target-level 3
 ```
 
-浏览器打开后，在页面里完成登录；登录完成后回到终端按 Enter。登录态会保存到 `~/.config/linuxdo-browser/profiles/main/`。
+浏览器打开后，在页面里完成登录；登录完成后回到终端按 Enter。登录态会保存到 `~/.config/linuxdo-browser/profiles/main/cloak/`。
 
 运行一次浏览测试流程：
 
@@ -117,7 +115,7 @@ uv run linuxdo-browser run --account main --max-topics 5
 uv run linuxdo-browser status --account main
 ```
 
-登录态保存在 `~/.config/linuxdo-browser/profiles/<account>/`。
+登录态保存在 `~/.config/linuxdo-browser/profiles/<account>/cloak/`。
 
 ## muyuan 签到
 
@@ -128,7 +126,7 @@ uv run linuxdo-browser muyuan-checkin --account main
 uv run linuxdo-browser muyuan-checkin --all
 ```
 
-首次执行时脚本会打开 `https://muyuan.do/login?expired=true`，勾选协议，点击 `Continue with LinuxDO`，在 LinuxDO OAuth 页面点击“允许”，随后进入个人页点击 `Check in now`。后续会复用同一个账号 profile 的登录态。
+首次执行时脚本会打开 `https://muyuan.do/login?expired=true`，勾选协议，点击 `Continue with LinuxDO`，在 LinuxDO OAuth 页面点击“允许”，随后进入个人页点击 `Check in now`。后续会复用同一个账号 CloakBrowser profile 的登录态。
 
 ## 常用命令
 
@@ -202,7 +200,7 @@ OPENAI_API_KEY=sk-xxx
 |------|------|
 | `config.json` | CLI 写入的运行配置 |
 | `linuxdo.sqlite3` | 账号、活动事件、运行记录、Connect 快照 |
-| `profiles/` | 多账号浏览器 profile |
+| `profiles/<account>/cloak/` | 多账号 CloakBrowser profile |
 | `state.json` / `profile/` | 旧版兼容文件，重新初始化时可删除 |
 
 完全重置：
@@ -221,4 +219,4 @@ uv run linuxdo-browser login
 45 9 * * * cd /path/to/anyrouter-check-in && uv run linuxdo-browser sync-status >> ~/.config/linuxdo-browser/cron.log 2>&1
 ```
 
-如果测试环境会触发验证码，请使用有界面的本机浏览器运行，并确保登录 profile 已经完成人工验证。
+如果测试环境会触发验证码，请使用有界面的 CloakBrowser 运行，并确保登录 profile 已经完成人工验证。
