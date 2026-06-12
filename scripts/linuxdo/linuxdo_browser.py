@@ -229,6 +229,7 @@ class BrowserConfig:
 	min_read_minutes_per_session: int = 0
 	return_to_list_delay_ms: int = 1000
 	headless: bool = False
+	auto_minimized: bool = True
 	stuck_timeout_sec: int = 30
 	use_chrome: bool = True
 	human_verify_timeout_sec: int = 300
@@ -575,6 +576,9 @@ class LinuxDoBrowser:
 		self.max_topics_override_logged = False
 		self._context: BrowserContext | None = None
 		self._page: Page | None = None
+		self._auto_minimize_suspended = False
+		self._window_state_warning_logged = False
+		self._verification_lock = asyncio.Lock()
 
 	@property
 	def profile_dir(self) -> Path:
@@ -588,19 +592,62 @@ class LinuxDoBrowser:
 	def log(self, message: str) -> None:
 		console.log(f'[cyan]linuxdo[/] {message}')
 
-	async def launch(self) -> Page:
+	def auto_minimized_active(self) -> bool:
+		return self.config.auto_minimized and not self.config.headless and not self._auto_minimize_suspended
+
+	async def set_browser_window_state(self, window_state: str, *, force: bool = False) -> None:
+		if self._context is None or self._page is None or self.config.headless:
+			return
+		if not force and not self.auto_minimized_active():
+			return
+
+		session = None
+		try:
+			session = await self.context.new_cdp_session(self.page)
+			window = await session.send('Browser.getWindowForTarget')
+			await session.send(
+				'Browser.setWindowBounds',
+				{'windowId': window['windowId'], 'bounds': {'windowState': window_state}},
+			)
+		except Exception:
+			if not self._window_state_warning_logged:
+				self._window_state_warning_logged = True
+				self.log('当前浏览器不支持自动最小化窗口，继续执行')
+		finally:
+			if session is not None:
+				with contextlib.suppress(Exception):
+					await session.detach()
+
+	async def show_browser_window(self, *, force: bool = False) -> None:
+		if self._page is None or self.config.headless:
+			return
+		if not force and not self.auto_minimized_active():
+			return
+		await self.set_browser_window_state('normal', force=force)
+		with contextlib.suppress(PlaywrightError, PlaywrightTimeoutError):
+			await self.page.bring_to_front()
+
+	async def minimize_browser_window(self) -> None:
+		await self.set_browser_window_state('minimized')
+
+	async def launch(self, *, auto_minimize: bool = True) -> Page:
 		self.profile_dir.mkdir(parents=True, exist_ok=True)
 		fingerprint_seed = cloak_fingerprint_seed(self.account, self.profile_dir)
+		launch_args = [*CLOAK_LAUNCH_ARGS, f'--fingerprint={fingerprint_seed}']
+		if auto_minimize and self.auto_minimized_active():
+			launch_args.insert(len(CLOAK_LAUNCH_ARGS), '--start-minimized')
 		self._context = await launch_persistent_context_async(
 			self.profile_dir,
 			headless=self.config.headless,
 			viewport=CLOAK_VIEWPORT,
 			locale='zh-CN',
-			args=[*CLOAK_LAUNCH_ARGS, f'--fingerprint={fingerprint_seed}'],
+			args=launch_args,
 			humanize=True,
 		)
 		self.log(f'使用 CloakBrowser stealth Chromium 启动（profile: {self.profile_dir}）')
 		self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+		if auto_minimize:
+			await self.minimize_browser_window()
 		return self._page
 
 	async def close(self) -> None:
@@ -681,17 +728,58 @@ class LinuxDoBrowser:
 		await sleep_range((1500, 2500))
 		return True
 
+	async def handle_cloudflare_verification(self, timeout_sec: int | None = None) -> bool:
+		if not await self.has_cloudflare_challenge():
+			return False
+
+		await self.show_browser_window()
+		timeout = timeout_sec or self.config.human_verify_timeout_sec
+		console.print(
+			Panel(
+				'检测到 [bold]Cloudflare 真人验证[/]\n'
+				'请在弹出的浏览器窗口中完成验证；验证通过后脚本会自动继续。',
+				title='真人验证',
+				border_style='yellow',
+			)
+		)
+
+		deadline = time.monotonic() + timeout
+		while time.monotonic() < deadline:
+			has_challenge = await self.has_cloudflare_challenge()
+			if not has_challenge:
+				console.print('[green]✓ Cloudflare 验证通过[/]')
+				await self.minimize_browser_window()
+				return True
+
+			if await self.has_cloudflare_clearance():
+				await self.recover_after_cloudflare()
+				if not await self.has_cloudflare_challenge():
+					console.print('[green]✓ Cloudflare 验证通过[/]')
+					await self.minimize_browser_window()
+					return True
+
+			await asyncio.sleep(1)
+
+		raise TimeoutError('Cloudflare 真人验证超时，请在浏览器中完成验证后重试')
+
 	async def watch_cloudflare_clearance(self) -> None:
 		reloaded_after_clearance = False
+		challenge_window_open = False
 		while self.running:
 			try:
 				has_challenge = await self.has_cloudflare_challenge()
 				has_clearance = await self.has_cloudflare_clearance()
+				if has_challenge and not challenge_window_open:
+					await self.show_browser_window()
+					challenge_window_open = True
 				if has_clearance and has_challenge and not reloaded_after_clearance:
 					await self.recover_after_cloudflare()
 					reloaded_after_clearance = True
 				if not has_challenge:
 					reloaded_after_clearance = False
+					if challenge_window_open:
+						await self.minimize_browser_window()
+						challenge_window_open = False
 			except TimeoutError:
 				raise
 			except asyncio.CancelledError:
@@ -787,37 +875,50 @@ class LinuxDoBrowser:
 		return bool(clicked)
 
 	async def handle_human_verification(self, timeout_sec: int | None = None) -> None:
-		if not await self.has_human_verification_modal():
+		has_cloudflare_challenge = await self.has_cloudflare_challenge()
+		has_human_modal = await self.has_human_verification_modal()
+		if not has_cloudflare_challenge and not has_human_modal:
+			return
+		if self._verification_lock.locked():
 			return
 
-		timeout = timeout_sec or self.config.human_verify_timeout_sec
-		console.print(
-			Panel(
-				'检测到 [bold]Human Verification[/] 弹窗\n'
-				'1. 勾选 hCaptcha「I am human」\n'
-				'2. 脚本会在验证完成后自动点击 [bold]Verify[/]\n'
-				'3. 若仍无法点击，请删除 profile 后重试:\n'
-				f'   [dim]rm -rf {self.profile_dir}[/]',
-				title='人机验证',
-				border_style='yellow',
-			)
-		)
-
-		deadline = time.monotonic() + timeout
-		while time.monotonic() < deadline:
+		async with self._verification_lock:
+			await self.handle_cloudflare_verification(timeout_sec=timeout_sec)
 			if not await self.has_human_verification_modal():
-				console.print('[green]✓ 人机验证通过[/]')
 				return
 
-			if await self.try_submit_human_verification():
-				await sleep_range((1500, 2500))
+			await self.show_browser_window()
+
+			timeout = timeout_sec or self.config.human_verify_timeout_sec
+			console.print(
+				Panel(
+					'检测到 [bold]Human Verification[/] 弹窗\n'
+					'1. 勾选 hCaptcha「I am human」\n'
+					'2. 脚本会在验证完成后自动点击 [bold]Verify[/]\n'
+					'3. 若仍无法点击，请删除 profile 后重试:\n'
+					f'   [dim]rm -rf {self.profile_dir}[/]',
+					title='人机验证',
+					border_style='yellow',
+				)
+			)
+
+			deadline = time.monotonic() + timeout
+			while time.monotonic() < deadline:
 				if not await self.has_human_verification_modal():
 					console.print('[green]✓ 人机验证通过[/]')
+					await self.minimize_browser_window()
 					return
 
-			await asyncio.sleep(0.8)
+				if await self.try_submit_human_verification():
+					await sleep_range((1500, 2500))
+					if not await self.has_human_verification_modal():
+						console.print('[green]✓ 人机验证通过[/]')
+						await self.minimize_browser_window()
+						return
 
-		raise TimeoutError('人机验证超时：Verify 按钮无法点击，请删除 profile 后用 Chrome 重新 login')
+				await asyncio.sleep(0.8)
+
+			raise TimeoutError('人机验证超时：Verify 按钮无法点击，请删除 profile 后用 Chrome 重新 login')
 
 	async def watch_human_verification(self) -> None:
 		while self.running:
@@ -848,53 +949,64 @@ class LinuxDoBrowser:
 		console.print('[yellow]等待 LinuxDO 登录超时[/]')
 		return False
 
-	async def interactive_login(self) -> bool:
-		await self.page.goto(f'{BASE_URL}/login', wait_until='domcontentloaded')
-		await self.handle_human_verification()
-		if await self.has_cloudflare_clearance() and await self.has_cloudflare_challenge():
-			await self.recover_after_cloudflare()
-		if await self.is_logged_in():
-			if self.store is not None and self.account is not None:
-				self.store.update_username(self.account.id, await self.get_current_username())
-			return True
-
-		self.running = True
-		verify_task = asyncio.create_task(self.watch_human_verification())
-		cloudflare_task = asyncio.create_task(self.watch_cloudflare_clearance())
-		account_hint = f' ({self.account.name})' if self.account is not None else ''
-		console.print(
-			Panel(
-				f'请在打开的浏览器中登录 [bold]linux.do[/]{account_hint}\n'
-				'1. 若出现 Cloudflare「请验证您是真人」，点选后等待页面跳转；\n'
-				'   若未自动跳转，脚本会在验证通过后自动刷新\n'
-				'2. 若出现 Human Verification，完成 hCaptcha 后脚本会自动点 Verify\n'
-				'3. 登录完成后脚本会自动继续 muyuan 流程',
-				title='Linux.do 登录',
-				border_style='bright_blue',
-			)
-		)
-		logged_in = False
+	async def interactive_login(self, *, minimize_on_success: bool = True) -> bool:
+		previous_auto_minimize_suspended = self._auto_minimize_suspended
+		self._auto_minimize_suspended = True
+		login_completed = False
 		try:
-			logged_in = await self.wait_for_interactive_login()
-		finally:
-			self.running = False
-			cloudflare_task.cancel()
-			verify_task.cancel()
-			with contextlib.suppress(asyncio.CancelledError):
-				await cloudflare_task
-				await verify_task
+			await self.show_browser_window(force=True)
+			await self.page.goto(f'{BASE_URL}/login', wait_until='domcontentloaded')
+			await self.handle_human_verification()
+			if await self.has_cloudflare_clearance() and await self.has_cloudflare_challenge():
+				await self.recover_after_cloudflare()
+			if await self.is_logged_in():
+				if self.store is not None and self.account is not None:
+					self.store.update_username(self.account.id, await self.get_current_username())
+				login_completed = True
+				return True
 
-		if not logged_in:
+			self.running = True
+			verify_task = asyncio.create_task(self.watch_human_verification())
+			cloudflare_task = asyncio.create_task(self.watch_cloudflare_clearance())
+			account_hint = f' ({self.account.name})' if self.account is not None else ''
+			console.print(
+				Panel(
+					f'请在打开的浏览器中登录 [bold]linux.do[/]{account_hint}\n'
+					'1. 若出现 Cloudflare「请验证您是真人」，点选后等待页面跳转；\n'
+					'   若未自动跳转，脚本会在验证通过后自动刷新\n'
+					'2. 若出现 Human Verification，完成 hCaptcha 后脚本会自动点 Verify\n'
+					'3. 登录完成后脚本会自动继续 muyuan 流程',
+					title='Linux.do 登录',
+					border_style='bright_blue',
+				)
+			)
+			logged_in = False
+			try:
+				logged_in = await self.wait_for_interactive_login()
+			finally:
+				self.running = False
+				cloudflare_task.cancel()
+				verify_task.cancel()
+				with contextlib.suppress(asyncio.CancelledError):
+					await cloudflare_task
+					await verify_task
+
+			if not logged_in:
+				return False
+
+			if await self.has_cloudflare_clearance() and await self.has_cloudflare_challenge():
+				await self.recover_after_cloudflare()
+			await self.handle_human_verification()
+			if await self.is_logged_in():
+				if self.store is not None and self.account is not None:
+					self.store.update_username(self.account.id, await self.get_current_username())
+				login_completed = True
+				return True
 			return False
-
-		if await self.has_cloudflare_clearance() and await self.has_cloudflare_challenge():
-			await self.recover_after_cloudflare()
-		await self.handle_human_verification()
-		if await self.is_logged_in():
-			if self.store is not None and self.account is not None:
-				self.store.update_username(self.account.id, await self.get_current_username())
-			return True
-		return False
+		finally:
+			self._auto_minimize_suspended = previous_auto_minimize_suspended
+			if login_completed and minimize_on_success and not previous_auto_minimize_suspended:
+				await self.minimize_browser_window()
 
 	async def ensure_logged_in(self, *, interactive: bool = False) -> None:
 		await self.page.goto(f'{BASE_URL}{self.config.list_path}', wait_until='domcontentloaded')
@@ -1879,6 +1991,15 @@ class LinuxDoBrowser:
 
 
 def build_parser() -> argparse.ArgumentParser:
+	def add_auto_minimized_arg(command_parser: argparse.ArgumentParser) -> None:
+		command_parser.add_argument(
+			'--auto-minimized',
+			dest='auto_minimized',
+			action=argparse.BooleanOptionalAction,
+			default=None,
+			help='Auto-minimize headed browser and restore it for verification',
+		)
+
 	parser = argparse.ArgumentParser(description='Linux.do auto browsing helper (CloakBrowser)')
 	subparsers = parser.add_subparsers(dest='command')
 
@@ -1887,11 +2008,13 @@ def build_parser() -> argparse.ArgumentParser:
 	accounts_add = accounts_subparsers.add_parser('add', help='Add an account and open login browser')
 	accounts_add.add_argument('name', help='Account display name')
 	accounts_add.add_argument('--target-level', type=int, default=2, help='Target trust level (1-4)')
+	add_auto_minimized_arg(accounts_add)
 	accounts_subparsers.add_parser('list', help='List accounts')
 
 	login_parser = subparsers.add_parser('login', help='Open browser and save login session')
 	login_parser.add_argument('--account', help='Account name or slug')
 	login_parser.add_argument('--headless', action='store_true', help='Run browser headless (not recommended)')
+	add_auto_minimized_arg(login_parser)
 
 	run_parser = subparsers.add_parser('run', help='Start auto browsing')
 	run_parser.add_argument('--account', help='Account name or slug')
@@ -1905,6 +2028,7 @@ def build_parser() -> argparse.ArgumentParser:
 	run_parser.add_argument('--daily-topic-limit', type=int, help='Max newly viewed topics per local day (0 disables)')
 	run_parser.add_argument('--daily-like-limit', type=int, help='Max likes per local day (0 disables)')
 	run_parser.add_argument('--headless', action='store_true', help='Run browser headless')
+	add_auto_minimized_arg(run_parser)
 
 	run_all_parser = subparsers.add_parser('run-all', help='Run all enabled accounts')
 	run_all_parser.add_argument('--speed', choices=list(SPEED_PRESETS), help='Speed preset')
@@ -1924,6 +2048,7 @@ def build_parser() -> argparse.ArgumentParser:
 		help='Skip accounts that already have a run session today',
 	)
 	run_all_parser.add_argument('--headless', action='store_true', help='Run browser headless')
+	add_auto_minimized_arg(run_all_parser)
 
 	stats_parser = subparsers.add_parser('stats', help='Show browsing stats')
 	stats_parser.add_argument('--account', help='Account name or slug')
@@ -1931,16 +2056,20 @@ def build_parser() -> argparse.ArgumentParser:
 	status_parser.add_argument('--account', help='Account name or slug')
 	status_parser.add_argument('--offline', action='store_true', help='Use cached status without opening browser')
 	status_parser.add_argument('--headless', action='store_true', help='Run browser headless during sync')
+	add_auto_minimized_arg(status_parser)
 	sync_parser = subparsers.add_parser('sync-status', help='Sync status from connect.linux.do')
 	sync_parser.add_argument('--account', help='Account name or slug')
 	sync_parser.add_argument('--headless', action='store_true', help='Run browser headless')
+	add_auto_minimized_arg(sync_parser)
 	muyuan_parser = subparsers.add_parser('muyuan-checkin', help='Check in on muyuan.do through LinuxDO OAuth')
 	muyuan_parser.add_argument('--account', help='Account name or slug')
 	muyuan_parser.add_argument('--all', action='store_true', help='Check in all enabled accounts')
 	muyuan_parser.add_argument('--headless', action='store_true', help='Run browser headless')
+	add_auto_minimized_arg(muyuan_parser)
 	review_likes_parser = subparsers.add_parser('review-likes', help='Review like candidates from browsed topics')
 	review_likes_parser.add_argument('--account', help='Account name or slug')
 	review_likes_parser.add_argument('--headless', action='store_true', help='Run browser headless')
+	add_auto_minimized_arg(review_likes_parser)
 	llm_reply_parser = subparsers.add_parser('llm-reply', help='Generate and review LLM replies for today topics')
 	llm_reply_parser.add_argument('--account', help='Account name or slug')
 	llm_reply_parser.add_argument('--count', type=int, help='Number of topics for LLM to select')
@@ -1951,6 +2080,7 @@ def build_parser() -> argparse.ArgumentParser:
 		help='Enable LLM reply flow for this run',
 	)
 	llm_reply_parser.add_argument('--headless', action='store_true', help='Run browser headless')
+	add_auto_minimized_arg(llm_reply_parser)
 	reply_parser = subparsers.add_parser('reply', help='Record manual replies')
 	reply_subparsers = reply_parser.add_subparsers(dest='reply_command')
 	reply_mark = reply_subparsers.add_parser('mark', help='Mark a topic as manually replied')
@@ -1967,6 +2097,7 @@ def build_parser() -> argparse.ArgumentParser:
 	import_parser.add_argument('--account', help='Account name or slug')
 	import_parser.add_argument('cookies', nargs='?', help='Cookie string: name1=val1; name2=val2')
 	import_parser.add_argument('--file', '-f', help='Read cookies from file')
+	add_auto_minimized_arg(import_parser)
 
 	subparsers.add_parser('tui', help='Open interactive terminal UI')
 
@@ -1996,6 +2127,8 @@ def apply_cli_overrides(config: BrowserConfig, args: argparse.Namespace) -> None
 		config.enable_llm_reply = args.enable_llm_reply
 	if getattr(args, 'headless', False):
 		config.headless = True
+	if getattr(args, 'auto_minimized', None) is not None:
+		config.auto_minimized = args.auto_minimized
 	config.validate()
 
 
@@ -2384,16 +2517,15 @@ def review_reply_text(topic: dict[str, str], reply: str) -> str | None:
 
 async def cmd_login(args: argparse.Namespace) -> int:
 	config = load_config()
-	if args.headless:
-		config.headless = True
+	apply_cli_overrides(config, args)
 	save_config(config)
 	store = get_store()
 	account = resolve_account(store, getattr(args, 'account', None))
 	browser = build_browser_for_account(config, store, account)
 
 	try:
-		await browser.launch()
-		if await browser.interactive_login():
+		await browser.launch(auto_minimize=False)
+		if await browser.interactive_login(minimize_on_success=False):
 			console.print('[green]✓ 登录状态已保存[/]')
 		else:
 			console.print('[yellow]未检测到登录元素，session 仍会保存，运行 run 时再验证[/]')
@@ -2431,6 +2563,7 @@ async def cmd_import_cookies(args: argparse.Namespace) -> int:
 		return 1
 
 	config = load_config()
+	apply_cli_overrides(config, args)
 	store = get_store()
 	account = resolve_account(store, getattr(args, 'account', None))
 	browser = build_browser_for_account(config, store, account)
@@ -2451,8 +2584,7 @@ async def cmd_import_cookies(args: argparse.Namespace) -> int:
 
 async def cmd_review_likes(args: argparse.Namespace) -> int:
 	config = load_config()
-	if getattr(args, 'headless', False):
-		config.headless = True
+	apply_cli_overrides(config, args)
 	store = get_store()
 	account = resolve_account(store, getattr(args, 'account', None))
 	browser = build_browser_for_account(config, store, account)
@@ -2467,13 +2599,10 @@ async def cmd_review_likes(args: argparse.Namespace) -> int:
 
 async def cmd_llm_reply(args: argparse.Namespace) -> int:
 	config = load_config()
-	if getattr(args, 'enable_llm_reply', None) is not None:
-		config.enable_llm_reply = args.enable_llm_reply
+	apply_cli_overrides(config, args)
 	if not config.enable_llm_reply:
 		console.print('[dim]LLM 评论已关闭[/]')
 		return 0
-	if getattr(args, 'headless', False):
-		config.headless = True
 	reply_count = getattr(args, 'count', None) or config.llm_topic_count
 	store = get_store()
 	account = resolve_account(store, getattr(args, 'account', None))
@@ -2672,7 +2801,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
 	console.print(
 		f'当前配置: speed={config.speed}, list={config.list_type}, like={config.enable_like}, '
 		f'like_pacing={config.like_chance}, max_topic_pages={config.max_topic_pages}, '
-		f'min_read_minutes={config.min_read_minutes_per_session}'
+		f'min_read_minutes={config.min_read_minutes_per_session}, auto_minimized={config.auto_minimized}'
 	)
 	return 0
 
@@ -2744,8 +2873,7 @@ async def cmd_accounts(args: argparse.Namespace) -> int:
 
 async def cmd_status(args: argparse.Namespace) -> int:
 	config = load_config()
-	if getattr(args, 'headless', False):
-		config.headless = True
+	apply_cli_overrides(config, args)
 	store = get_store()
 	account = resolve_account(store, getattr(args, 'account', None))
 	if not getattr(args, 'offline', False):
@@ -2756,8 +2884,7 @@ async def cmd_status(args: argparse.Namespace) -> int:
 
 async def cmd_sync_status(args: argparse.Namespace) -> int:
 	config = load_config()
-	if getattr(args, 'headless', False):
-		config.headless = True
+	apply_cli_overrides(config, args)
 	store = get_store()
 	account = resolve_account(store, getattr(args, 'account', None))
 	if not await try_sync_status_for_account(config, store, account):
@@ -2780,8 +2907,7 @@ async def muyuan_checkin_for_account(config: BrowserConfig, store: AccountStore,
 
 async def cmd_muyuan_checkin(args: argparse.Namespace) -> int:
 	config = load_config()
-	if getattr(args, 'headless', False):
-		config.headless = True
+	apply_cli_overrides(config, args)
 	store = get_store()
 	accounts = (
 		[account for account in store.list_accounts() if account.enabled]
@@ -2935,6 +3061,7 @@ def tui_args(command: str, **overrides: Any) -> argparse.Namespace:
 		'command': command,
 		'account': None,
 		'headless': False,
+		'auto_minimized': None,
 		'speed': None,
 		'list_type': None,
 		'enable_like': None,
@@ -3221,6 +3348,7 @@ def tui_collect_run_args(account_slug: str | None, command: str = 'run') -> argp
 	if enable_like:
 		like_chance = Prompt.ask('备用点赞节奏', choices=list(LIKE_CHANCE_PRESETS), default=config.like_chance)
 	headless = Confirm.ask('无头运行', default=config.headless)
+	auto_minimized = Confirm.ask('自动最小化浏览器', default=config.auto_minimized)
 	skip_run_today = False
 	if command == 'run-all':
 		skip_run_today = Confirm.ask('跳过今日已执行账号', default=True)
@@ -3237,6 +3365,7 @@ def tui_collect_run_args(account_slug: str | None, command: str = 'run') -> argp
 		enable_like=enable_like,
 		like_chance=like_chance,
 		headless=headless,
+		auto_minimized=auto_minimized,
 		skip_run_today=skip_run_today,
 	)
 
@@ -3255,6 +3384,7 @@ def tui_edit_config() -> None:
 		config.min_read_minutes_per_session,
 		0,
 	)
+	config.auto_minimized = Confirm.ask('默认自动最小化浏览器', default=config.auto_minimized)
 	config.daily_topic_limit = tui_prompt_int('默认今日话题上限（0 表示不限）', config.daily_topic_limit, 0)
 	config.daily_like_limit = tui_prompt_int('默认今日点赞上限（0 表示不限）', config.daily_like_limit, 0)
 	config.return_to_list_delay_ms = tui_prompt_int('返回列表延迟 ms', config.return_to_list_delay_ms, 0)

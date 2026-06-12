@@ -57,6 +57,7 @@ def test_parser_accepts_account_scoped_run_and_reply():
 			'--daily-like-limit',
 			'2',
 			'--no-like',
+			'--no-auto-minimized',
 		]
 	)
 	reply_args = parser.parse_args(['reply', 'mark', '123', '--account', 'main'])
@@ -69,6 +70,7 @@ def test_parser_accepts_account_scoped_run_and_reply():
 	assert run_args.daily_topic_limit == 3
 	assert run_args.daily_like_limit == 2
 	assert run_args.enable_like is False
+	assert run_args.auto_minimized is False
 	assert reply_args.command == 'reply'
 	assert reply_args.reply_command == 'mark'
 	assert reply_args.topic_id == '123'
@@ -139,6 +141,7 @@ def test_tui_args_provides_cli_defaults():
 	assert args.command == 'run'
 	assert args.account == 'main'
 	assert args.headless is False
+	assert args.auto_minimized is None
 	assert args.max_topics is None
 	assert args.enable_like is None
 	assert args.enable_llm_reply is None
@@ -187,6 +190,10 @@ def test_read_terminal_key_maps_up_and_down_arrows():
 
 def test_browser_config_enables_llm_reply_by_default():
 	assert BrowserConfig().enable_llm_reply is True
+
+
+def test_browser_config_enables_auto_minimized_by_default():
+	assert BrowserConfig().auto_minimized is True
 
 
 def test_openai_base_url_normalization_and_json_extraction():
@@ -577,6 +584,79 @@ def test_read_minutes_accumulate_across_short_topics():
 
 	browser.record_read_time('102', 1)
 	assert browser.state.session_read_minutes == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_minimized_window_state_uses_cdp():
+	class FakeCDPSession:
+		def __init__(self):
+			self.commands = []
+			self.detached = False
+
+		async def send(self, method, params=None):
+			self.commands.append((method, params))
+			if method == 'Browser.getWindowForTarget':
+				return {'windowId': 7}
+			return {}
+
+		async def detach(self):
+			self.detached = True
+
+	class FakeContext:
+		def __init__(self, session):
+			self.session = session
+
+		async def new_cdp_session(self, _page):
+			return self.session
+
+	class FakePage:
+		def __init__(self):
+			self.brought_to_front = False
+
+		async def bring_to_front(self):
+			self.brought_to_front = True
+
+	session = FakeCDPSession()
+	page = FakePage()
+	browser = LinuxDoBrowser(BrowserConfig(auto_minimized=True), BrowserState())
+	browser._context = FakeContext(session)
+	browser._page = page
+
+	await browser.show_browser_window()
+	await browser.minimize_browser_window()
+
+	assert page.brought_to_front is True
+	assert ('Browser.setWindowBounds', {'windowId': 7, 'bounds': {'windowState': 'normal'}}) in session.commands
+	assert ('Browser.setWindowBounds', {'windowId': 7, 'bounds': {'windowState': 'minimized'}}) in session.commands
+	assert session.detached is True
+
+
+@pytest.mark.asyncio
+async def test_human_verification_restores_and_minimizes(monkeypatch):
+	browser = LinuxDoBrowser(BrowserConfig(auto_minimized=True), BrowserState())
+	events = []
+	human_modal_results = iter([True, True, False])
+
+	async def no_cloudflare_challenge():
+		return False
+
+	async def has_human_modal():
+		return next(human_modal_results)
+
+	async def show_window():
+		events.append('show')
+
+	async def minimize_window():
+		events.append('minimize')
+
+	monkeypatch.setattr(browser, 'has_cloudflare_challenge', no_cloudflare_challenge)
+	monkeypatch.setattr(browser, 'has_human_verification_modal', has_human_modal)
+	monkeypatch.setattr(browser, 'show_browser_window', show_window)
+	monkeypatch.setattr(browser, 'minimize_browser_window', minimize_window)
+
+	await browser.handle_human_verification()
+
+	assert events == ['show', 'minimize']
 
 
 def test_topic_like_interval_uses_daily_limit_ratio():

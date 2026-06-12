@@ -29,6 +29,7 @@ error_console = Console(stderr=True)
 
 DEFAULT_OUTPUT_FILE = Path.home() / 'Downloads' / 'setup_cc_codex.bash'
 DEFAULT_PROXY_HOST = '127.0.0.1'
+DEFAULT_NODE_VERSION = '22.16.0'
 LOCAL_HTTP_URL_RE = re.compile(
 	r'http://(?P<host>127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])'
 	r'(?::(?P<port>\d{1,5}))?'
@@ -83,8 +84,13 @@ set -euo pipefail
 
 PUBLIC_PROXY_URL={public_proxy_url}
 LOCAL_PROXY_PORT={local_proxy_port}
+NODE_VERSION={node_version}
+NODE_USER_PREFIX="${{HOME}}/.local/node"
 NPM_USER_PREFIX="${{NPM_CONFIG_PREFIX:-${{HOME}}/.npm-global}}"
+NEEDS_NODE_USER_PATH=0
 NEEDS_NPM_USER_PATH=0
+USER_PATH_HOOK_START='# >>> setup_cc_codex PATH >>>'
+USER_PATH_HOOK_END='# <<< setup_cc_codex PATH <<<'
 
 backup_file() {{
   local path="$1"
@@ -93,36 +99,75 @@ backup_file() {{
   fi
 }}
 
-run_apt_get() {{
-  if [[ "${{EUID:-$(id -u)}}" -eq 0 ]]; then
-    apt-get "$@"
+detect_node_platform() {{
+  local os arch
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  case "$(uname -m)" in
+    x86_64|amd64) arch="x64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) return 1 ;;
+  esac
+
+  case "$os" in
+    linux) printf 'linux-%s' "$arch" ;;
+    darwin) printf 'darwin-%s' "$arch" ;;
+    *) return 1 ;;
+  esac
+}}
+
+download_file() {{
+  local url="$1"
+  local dest="$2"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$dest"
     return
   fi
 
-  if command -v sudo >/dev/null 2>&1; then
-    sudo apt-get "$@"
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO "$dest" "$url"
     return
   fi
 
-  printf 'ERROR: apt-get requires root or sudo.\n' >&2
+  printf 'ERROR: curl or wget is required to download Node.js.\n' >&2
   return 1
 }}
 
-install_npm_with_apt() {{
-  if [[ "$(uname -s)" != "Linux" ]]; then
+install_node_from_official_binary() {{
+  local platform dist_name url tmp_dir extract_dir
+
+  if ! platform="$(detect_node_platform)"; then
+    printf 'ERROR: unsupported platform for automatic Node.js install.\n' >&2
     return 1
   fi
 
-  if ! command -v apt-get >/dev/null 2>&1; then
+  dist_name="node-v${{NODE_VERSION}}-${{platform}}"
+  url="https://nodejs.org/dist/v${{NODE_VERSION}}/${{dist_name}}.tar.xz"
+  tmp_dir="$(mktemp -d)"
+  extract_dir="$tmp_dir/$dist_name"
+
+  printf 'npm not found; installing Node.js %s via official binary (%s)...\n' "$NODE_VERSION" "$platform"
+  if ! download_file "$url" "$tmp_dir/node.tar.xz"; then
+    rm -rf "$tmp_dir"
     return 1
   fi
 
-  printf 'npm not found; installing via apt...\n'
-  if ! run_apt_get update -qq; then
+  if ! tar -xJf "$tmp_dir/node.tar.xz" -C "$tmp_dir"; then
+    rm -rf "$tmp_dir"
     return 1
   fi
 
-  DEBIAN_FRONTEND=noninteractive run_apt_get install -y npm
+  mkdir -p "$NODE_USER_PREFIX"
+  rm -rf "$NODE_USER_PREFIX/bin" "$NODE_USER_PREFIX/lib" "$NODE_USER_PREFIX/include" "$NODE_USER_PREFIX/share"
+  cp -R "$extract_dir/"* "$NODE_USER_PREFIX/"
+  rm -rf "$tmp_dir"
+
+  mark_user_node
+}}
+
+mark_user_node() {{
+  NEEDS_NODE_USER_PATH=1
+  prepend_path_once "$NODE_USER_PREFIX/bin"
 }}
 
 ensure_npm_available() {{
@@ -130,7 +175,7 @@ ensure_npm_available() {{
     return 0
   fi
 
-  if install_npm_with_apt && command -v npm >/dev/null 2>&1; then
+  if install_node_from_official_binary && command -v npm >/dev/null 2>&1; then
     printf 'npm installed: %s\n' "$(command -v npm)"
     return 0
   fi
@@ -142,10 +187,62 @@ ensure_npm_available() {{
 
 prepend_path_once() {{
   local dir="$1"
+  local cleaned
+
   case ":$PATH:" in
-    *":$dir:"*) ;;
+    *":$dir:"*)
+      cleaned=":${{PATH}}:"
+      cleaned="${{cleaned//:$dir:/:}}"
+      cleaned="${{cleaned#:}}"
+      cleaned="${{cleaned%:}}"
+      export PATH="$dir:${{cleaned}}"
+      ;;
     *) export PATH="$dir:$PATH" ;;
   esac
+}}
+
+client_binary_blocked() {{
+  local binary="$1"
+  local path
+  local npm_prefix
+
+  path="$(command -v "$binary" 2>/dev/null)" || return 1
+  case "$path" in
+    "$NPM_USER_PREFIX"/*)
+      return 1
+      ;;
+    /snap/bin/*|/snap/*/*)
+      printf '%s: ignoring snap shim at %s; installing npm client instead.\n' "$binary" "$path"
+      return 0
+      ;;
+  esac
+
+  if command -v npm >/dev/null 2>&1; then
+    npm_prefix="$(npm_global_prefix)"
+    if [[ "$path" == "$npm_prefix/bin/$binary" ]] && npm_global_prefix_writable; then
+      return 1
+    fi
+    printf '%s: ignoring system install at %s; using %s instead (npm prefix %s).\n' \
+      "$binary" "$path" "$NPM_USER_PREFIX" "$npm_prefix"
+    return 0
+  fi
+
+  printf '%s: ignoring system install at %s; using %s instead.\n' "$binary" "$path" "$NPM_USER_PREFIX"
+  return 0
+}}
+
+configure_npm_user_prefix() {{
+  mkdir -p "$NPM_USER_PREFIX"
+  export NPM_CONFIG_PREFIX="$NPM_USER_PREFIX"
+  if command -v npm >/dev/null 2>&1; then
+    npm config set prefix "$NPM_USER_PREFIX" --location=user 2>/dev/null || true
+  fi
+}}
+
+mark_user_npm_cli() {{
+  NEEDS_NPM_USER_PATH=1
+  configure_npm_user_prefix
+  prepend_path_once "$NPM_USER_PREFIX/bin"
 }}
 
 npm_global_prefix() {{
@@ -168,24 +265,43 @@ npm_global_prefix_writable() {{
 install_npm_cli_to_user_prefix() {{
   local package="$1"
 
-  mkdir -p "$NPM_USER_PREFIX"
+  configure_npm_user_prefix
   NPM_CONFIG_PREFIX="$NPM_USER_PREFIX" npm install -g "$package"
-  prepend_path_once "$NPM_USER_PREFIX/bin"
-  NEEDS_NPM_USER_PATH=1
+  mark_user_npm_cli
 }}
 
 install_npm_cli() {{
   local label="$1"
   local binary="$2"
   local package="$3"
+  local existing_path
 
   if command -v "$binary" >/dev/null 2>&1; then
-    printf '%s found: %s\n' "$label" "$(command -v "$binary")"
-    return 0
+    existing_path="$(command -v "$binary")"
+    if ! client_binary_blocked "$binary"; then
+      case "$existing_path" in
+        "$NPM_USER_PREFIX"/*)
+          mark_user_npm_cli
+          ;;
+      esac
+      printf '%s found: %s\n' "$label" "$existing_path"
+      return 0
+    fi
+    if [[ -x "$NPM_USER_PREFIX/bin/$binary" ]]; then
+      mark_user_npm_cli
+      printf '%s using user install: %s/bin/%s (ignored system %s)\n' \
+        "$label" "$NPM_USER_PREFIX" "$binary" "$existing_path"
+      return 0
+    fi
+    printf '%s blocked at %s; installing %s via npm...\n' "$label" "$existing_path" "$package"
+  else
+    ensure_npm_available
+    printf '%s not found; installing %s...\n' "$label" "$package"
   fi
 
-  ensure_npm_available
-  printf '%s not found; installing %s...\n' "$label" "$package"
+  if ! command -v npm >/dev/null 2>&1; then
+    ensure_npm_available
+  fi
 
   if npm_global_prefix_writable; then
     npm install -g "$package" || true
@@ -239,9 +355,17 @@ write_config_file() {{
   local target="$1"
   local mode="$2"
   local label="$3"
+  local target_dir
   local tmp_file
 
-  mkdir -p "$(dirname "$target")"
+  target_dir="$(dirname "$target")"
+  mkdir -p "$target_dir"
+  chmod u+rwx "$target_dir" 2>/dev/null || true
+  if [[ ! -w "$target_dir" ]]; then
+    printf 'ERROR: cannot write config directory %s\n' "$target_dir" >&2
+    return 1
+  fi
+
   backup_file "$target"
   tmp_file="$(mktemp)"
   if ! base64_decode > "$tmp_file"; then
@@ -254,26 +378,93 @@ write_config_file() {{
   printf '%s: %s\n' "$label" "$target"
 }}
 
+prefer_user_cli_path() {{
+  if [[ -d "$NPM_USER_PREFIX/bin" ]]; then
+    configure_npm_user_prefix
+    prepend_path_once "$NPM_USER_PREFIX/bin"
+  fi
+}}
+
 ensure_user_path_hook() {{
   local rc_file="$1"
+  local path_prefix=""
   local hook_line
+  local tmp_file
+  local use_npm_prefix=0
 
-  if [[ "$NEEDS_NPM_USER_PATH" != "1" ]]; then
+  if [[ "$NEEDS_NODE_USER_PATH" == "1" ]] || [[ -x "$NODE_USER_PREFIX/bin/node" ]]; then
+    path_prefix="${{NODE_USER_PREFIX}}/bin"
+  fi
+  if [[ "$NEEDS_NPM_USER_PATH" == "1" ]] \
+    || [[ -x "$NPM_USER_PREFIX/bin/claude" ]] \
+    || [[ -x "$NPM_USER_PREFIX/bin/codex" ]]; then
+    use_npm_prefix=1
+    if [[ -n "$path_prefix" ]]; then
+      path_prefix="${{path_prefix}}:${{NPM_USER_PREFIX}}/bin"
+    else
+      path_prefix="${{NPM_USER_PREFIX}}/bin"
+    fi
+  fi
+  if [[ -z "$path_prefix" ]]; then
     return 0
   fi
 
-  hook_line="export PATH=\"${{NPM_USER_PREFIX}}/bin:\$PATH\""
+  hook_line="export PATH=\"${{path_prefix}}:\$PATH\""
   mkdir -p "$(dirname "$rc_file")"
   touch "$rc_file"
-  if grep -F "${{NPM_USER_PREFIX}}/bin" "$rc_file" >/dev/null 2>&1; then
+  backup_file "$rc_file"
+  tmp_file="$(mktemp)"
+
+  awk -v start="$USER_PATH_HOOK_START" -v end="$USER_PATH_HOOK_END" '
+    $0 == start {{ skip = 1; next }}
+    $0 == end {{ skip = 0; next }}
+    skip == 1 {{ next }}
+    {{ print }}
+  ' "$rc_file" > "$tmp_file"
+
+  {{
+    cat "$tmp_file"
+    printf '\n%s\n' "$USER_PATH_HOOK_START"
+    printf '# Added by setup_cc_codex.bash\n'
+    if [[ "$use_npm_prefix" == "1" ]]; then
+      printf 'export NPM_CONFIG_PREFIX=%q\n' "$NPM_USER_PREFIX"
+    fi
+    printf '%s\n' "$hook_line"
+    printf '%s\n' "$USER_PATH_HOOK_END"
+  }} > "$rc_file"
+
+  rm -f "$tmp_file"
+}}
+
+print_path_refresh_instructions() {{
+  local path_prefix=""
+  local use_npm_prefix=0
+
+  if [[ -x "$NODE_USER_PREFIX/bin/node" ]]; then
+    path_prefix="${{NODE_USER_PREFIX}}/bin"
+  fi
+  if [[ -x "$NPM_USER_PREFIX/bin/claude" ]] || [[ -x "$NPM_USER_PREFIX/bin/codex" ]]; then
+    use_npm_prefix=1
+    if [[ -n "$path_prefix" ]]; then
+      path_prefix="${{path_prefix}}:${{NPM_USER_PREFIX}}/bin"
+    else
+      path_prefix="${{NPM_USER_PREFIX}}/bin"
+    fi
+  fi
+  if [[ -z "$path_prefix" ]]; then
     return 0
   fi
 
-  backup_file "$rc_file"
-  {{
-    printf '\n# Added by setup_cc_codex.bash\n'
-    printf '%s\n' "$hook_line"
-  }} >> "$rc_file"
+  printf '\nUser CLI installs live under %s (and/or %s).\n' "$NPM_USER_PREFIX" "$NODE_USER_PREFIX"
+  printf 'This script ran in a subshell, so your current terminal may still prefer /usr/local/bin or /snap/bin.\n'
+  printf 'Refresh PATH in this shell now:\n'
+  if [[ "$use_npm_prefix" == "1" ]]; then
+    printf '  export NPM_CONFIG_PREFIX=%q\n' "$NPM_USER_PREFIX"
+  fi
+  printf '  export PATH="%s:$PATH"\n' "$path_prefix"
+  printf 'Or reload shell config:\n'
+  printf '  source ~/.zshrc   # zsh\n'
+  printf '  source ~/.bashrc  # bash\n'
 }}
 
 ensure_ssl_cert_file_hook() {{
@@ -309,7 +500,9 @@ main() {{
 """
 
 SETUP_SCRIPT_FOOTER = r"""
+  prefer_user_cli_path
   ensure_linux_ssl_cert_file
+  ensure_user_path_hook "${HOME}/.zprofile"
   ensure_user_path_hook "${HOME}/.zshrc"
   ensure_user_path_hook "${HOME}/.bashrc"
 
@@ -318,6 +511,7 @@ SETUP_SCRIPT_FOOTER = r"""
   printf 'Local proxy port expected by generator: %s\n' "$LOCAL_PROXY_PORT"
   printf 'Claude Code client: %s\n' "$(command -v claude)"
   printf 'Codex client: %s\n' "$(command -v codex)"
+  print_path_refresh_instructions
 }
 
 main "$@"
@@ -490,6 +684,7 @@ def build_setup_script(payloads: list[ConfigPayload], port: int, public_url: str
 		SETUP_SCRIPT_HEADER.format(
 			public_proxy_url=shlex.quote(public_url),
 			local_proxy_port=shlex.quote(str(port)),
+			node_version=shlex.quote(DEFAULT_NODE_VERSION),
 		)
 	]
 
