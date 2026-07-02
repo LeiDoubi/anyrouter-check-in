@@ -85,12 +85,43 @@ set -euo pipefail
 PUBLIC_PROXY_URL={public_proxy_url}
 LOCAL_PROXY_PORT={local_proxy_port}
 NODE_VERSION={node_version}
+INSTALL_CLIENTS=1
 NODE_USER_PREFIX="${{HOME}}/.local/node"
 NPM_USER_PREFIX="${{NPM_CONFIG_PREFIX:-${{HOME}}/.npm-global}}"
 NEEDS_NODE_USER_PATH=0
 NEEDS_NPM_USER_PATH=0
 USER_PATH_HOOK_START='# >>> setup_cc_codex PATH >>>'
 USER_PATH_HOOK_END='# <<< setup_cc_codex PATH <<<'
+
+usage() {{
+  cat <<'USAGE'
+Usage: setup_cc_codex.bash [-n|--no-install]
+
+Options:
+  -n, --no-install  Skip installing Claude Code and Codex clients.
+  -h, --help        Show this help.
+USAGE
+}}
+
+parse_setup_args() {{
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--no-install)
+        INSTALL_CLIENTS=0
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        printf 'ERROR: unknown option: %s\n' "$1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+    shift
+  done
+}}
 
 backup_file() {{
   local path="$1"
@@ -469,11 +500,16 @@ print_path_refresh_instructions() {{
 
 ensure_ssl_cert_file_hook() {{
   local rc_file="$1"
-  local hook_line='export SSL_CERT_FILE=/usr/lib/ssl/cert.pem'
+  local cert_file='/usr/lib/ssl/cert.pem'
+  local hook_line="export SSL_CERT_FILE=${{cert_file}}"
+
+  if [[ ! -f "$cert_file" ]]; then
+    return 0
+  fi
 
   mkdir -p "$(dirname "$rc_file")"
   touch "$rc_file"
-  if grep -F 'SSL_CERT_FILE=/usr/lib/ssl/cert.pem' "$rc_file" >/dev/null 2>&1; then
+  if grep -F "$hook_line" "$rc_file" >/dev/null 2>&1; then
     return 0
   fi
 
@@ -495,7 +531,13 @@ ensure_linux_ssl_cert_file() {{
 }}
 
 main() {{
-  ensure_clients
+  parse_setup_args "$@"
+
+  if [[ "$INSTALL_CLIENTS" == "1" ]]; then
+    ensure_clients
+  else
+    printf 'Skipping Claude Code / Codex client installation.\n'
+  fi
 
 """
 
@@ -509,8 +551,16 @@ SETUP_SCRIPT_FOOTER = r"""
   printf '\nClaude Code / Codex proxy setup complete.\n'
   printf 'Proxy URL: %s\n' "$PUBLIC_PROXY_URL"
   printf 'Local proxy port expected by generator: %s\n' "$LOCAL_PROXY_PORT"
-  printf 'Claude Code client: %s\n' "$(command -v claude)"
-  printf 'Codex client: %s\n' "$(command -v codex)"
+  if command -v claude >/dev/null 2>&1; then
+    printf 'Claude Code client: %s\n' "$(command -v claude)"
+  else
+    printf 'Claude Code client: not installed or not on PATH\n'
+  fi
+  if command -v codex >/dev/null 2>&1; then
+    printf 'Codex client: %s\n' "$(command -v codex)"
+  else
+    printf 'Codex client: not installed or not on PATH\n'
+  fi
   print_path_refresh_instructions
 }
 
@@ -602,7 +652,7 @@ def warn_missing_local_configs(missing: list[ConfigSpec], plain: bool) -> None:
 	lines = '\n'.join(f'  - {spec.source} ({spec.label})' for spec in missing)
 	message = (
 		'本地未找到以下 Claude/Codex 配置文件，将跳过打包；'
-		'生成的脚本仍会安装客户端。\n'
+		'生成的脚本仍可继续执行。\n'
 		f'{lines}\n'
 		'若无法从现有配置推断代理端口，请使用 --port。'
 	)
