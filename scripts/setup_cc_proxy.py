@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gzip
+import io
 import re
 import shlex
 import socket
 import sys
+import tarfile
 import textwrap
 import time
 from dataclasses import dataclass
@@ -53,6 +56,21 @@ class ConfigPayload:
 	replacements: int
 
 
+@dataclass(frozen=True)
+class ArchiveSpec:
+	label: str
+	source: Path
+	target_rel: str
+	required: bool = True
+
+
+@dataclass(frozen=True)
+class ArchivePayload:
+	spec: ArchiveSpec
+	content: bytes
+	files: int
+
+
 DEFAULT_CONFIG_SPECS = [
 	ConfigSpec(
 		'Claude Code settings',
@@ -74,6 +92,10 @@ OPTIONAL_CONFIG_SPECS = {
 		False,
 	),
 }
+
+DEFAULT_ARCHIVE_SPECS = [
+	ArchiveSpec('Codex skills', Path.home() / '.codex' / 'skills', '.codex/skills', required=False),
+]
 
 SETUP_SCRIPT_HEADER = r"""#!/usr/bin/env bash
 set -euo pipefail
@@ -164,11 +186,99 @@ download_file() {{
   return 1
 }}
 
+install_system_node_prereqs() {{
+  if [[ "${{SETUP_CC_CODEX_SKIP_PKG_INSTALL:-0}}" == "1" ]]; then
+    return 1
+  fi
+
+  if [[ "${{EUID:-$(id -u 2>/dev/null || printf 1)}}" != "0" ]]; then
+    return 1
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    printf 'Installing Node.js download/extraction prerequisites via apt-get...\n'
+    DEBIAN_FRONTEND=noninteractive apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl tar xz-utils
+    return
+  fi
+
+  if command -v apk >/dev/null 2>&1; then
+    printf 'Installing Node.js download/extraction prerequisites via apk...\n'
+    apk add --no-cache ca-certificates curl tar xz
+    return
+  fi
+
+  if command -v dnf >/dev/null 2>&1; then
+    printf 'Installing Node.js download/extraction prerequisites via dnf...\n'
+    dnf install -y ca-certificates curl tar xz
+    return
+  fi
+
+  if command -v yum >/dev/null 2>&1; then
+    printf 'Installing Node.js download/extraction prerequisites via yum...\n'
+    yum install -y ca-certificates curl tar xz
+    return
+  fi
+
+  if command -v microdnf >/dev/null 2>&1; then
+    printf 'Installing Node.js download/extraction prerequisites via microdnf...\n'
+    microdnf install -y ca-certificates curl tar xz
+    return
+  fi
+
+  if command -v pacman >/dev/null 2>&1; then
+    printf 'Installing Node.js download/extraction prerequisites via pacman...\n'
+    pacman -Sy --noconfirm --needed ca-certificates curl tar xz
+    return
+  fi
+
+  return 1
+}}
+
+ensure_node_install_prereqs() {{
+  local missing=0
+
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    missing=1
+  fi
+  if ! command -v tar >/dev/null 2>&1; then
+    missing=1
+  fi
+  if ! command -v xz >/dev/null 2>&1; then
+    missing=1
+  fi
+
+  if [[ "$missing" == "1" ]]; then
+    install_system_node_prereqs || true
+    hash -r 2>/dev/null || true
+  fi
+
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    printf 'ERROR: curl or wget is required to download Node.js.\n' >&2
+    printf 'Install curl or wget, then rerun this setup script.\n' >&2
+    return 1
+  fi
+  if ! command -v tar >/dev/null 2>&1; then
+    printf 'ERROR: tar is required to extract Node.js.\n' >&2
+    printf 'Install tar, then rerun this setup script.\n' >&2
+    return 1
+  fi
+  if ! command -v xz >/dev/null 2>&1; then
+    printf 'ERROR: xz is required to extract the official Node.js .tar.xz archive.\n' >&2
+    printf 'Install xz/xz-utils, then rerun this setup script.\n' >&2
+    return 1
+  fi
+}}
+
 install_node_from_official_binary() {{
   local platform dist_name url tmp_dir extract_dir
 
   if ! platform="$(detect_node_platform)"; then
     printf 'ERROR: unsupported platform for automatic Node.js install.\n' >&2
+    return 1
+  fi
+
+  if ! ensure_node_install_prereqs; then
     return 1
   fi
 
@@ -406,6 +516,49 @@ write_config_file() {{
 
   mv "$tmp_file" "$target"
   chmod "$mode" "$target" 2>/dev/null || true
+  printf '%s: %s\n' "$label" "$target"
+}}
+
+write_archive_dir() {{
+  local target="$1"
+  local label="$2"
+  local target_parent
+  local tmp_archive
+  local backup_path
+
+  if ! command -v tar >/dev/null 2>&1; then
+    printf 'ERROR: tar is required to extract %s.\n' "$label" >&2
+    return 1
+  fi
+
+  target_parent="$(dirname "$target")"
+  mkdir -p "$target_parent"
+  chmod u+rwx "$target_parent" 2>/dev/null || true
+  if [[ ! -w "$target_parent" ]]; then
+    printf 'ERROR: cannot write target directory %s\n' "$target_parent" >&2
+    return 1
+  fi
+
+  if [[ -e "$target" || -L "$target" ]]; then
+    backup_path="${{target}}.bak.$(date +%Y%m%d%H%M%S)"
+    mv "$target" "$backup_path"
+    printf '%s backup: %s\n' "$label" "$backup_path"
+  fi
+
+  mkdir -p "$target"
+  tmp_archive="$(mktemp)"
+  if ! base64_decode > "$tmp_archive"; then
+    rm -f "$tmp_archive"
+    return 1
+  fi
+
+  if ! tar -xzf "$tmp_archive" -C "$target"; then
+    rm -f "$tmp_archive"
+    return 1
+  fi
+
+  rm -f "$tmp_archive"
+  chmod -R u+rwX "$target" 2>/dev/null || true
   printf '%s: %s\n' "$label" "$target"
 }}
 
@@ -662,6 +815,18 @@ def warn_missing_local_configs(missing: list[ConfigSpec], plain: bool) -> None:
 		error_console.print(f'[yellow]WARNING:[/] {message}')
 
 
+def warn_missing_local_archives(missing: list[ArchiveSpec], plain: bool) -> None:
+	if not missing:
+		return
+
+	lines = '\n'.join(f'  - {spec.source} ({spec.label})' for spec in missing)
+	message = f'本地未找到以下目录，将跳过打包；生成的脚本仍可继续执行。\n{lines}'
+	if plain:
+		print(f'WARNING: {message}', file=sys.stderr)
+	else:
+		error_console.print(f'[yellow]WARNING:[/] {message}')
+
+
 def iter_local_proxy_ports(texts: dict[ConfigSpec, str]) -> list[int]:
 	ports: list[int] = []
 	for content in texts.values():
@@ -719,8 +884,54 @@ def build_payloads(texts: dict[ConfigSpec, str], port: int, public_url: str) -> 
 	return payloads
 
 
+def tar_filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
+	if tarinfo.name.startswith('__MACOSX/') or '/__MACOSX/' in tarinfo.name:
+		return None
+	if tarinfo.name == '.DS_Store' or tarinfo.name.endswith('/.DS_Store'):
+		return None
+	tarinfo.uid = 0
+	tarinfo.gid = 0
+	tarinfo.uname = ''
+	tarinfo.gname = ''
+	tarinfo.mtime = 0
+	return tarinfo
+
+
+def build_archive_payload(spec: ArchiveSpec) -> ArchivePayload:
+	if not spec.source.is_dir():
+		raise FileNotFoundError(f'{spec.label} directory not found: {spec.source}')
+
+	buffer = io.BytesIO()
+	with gzip.GzipFile(fileobj=buffer, mode='wb', mtime=0) as gzip_file:
+		with tarfile.open(fileobj=gzip_file, mode='w', dereference=True) as archive:
+			for child in sorted(spec.source.iterdir(), key=lambda path: path.name):
+				archive.add(child, arcname=child.name, recursive=True, filter=tar_filter)
+
+	files = 0
+	with tarfile.open(fileobj=io.BytesIO(buffer.getvalue()), mode='r:gz') as archive:
+		files = sum(1 for member in archive.getmembers() if member.isfile())
+
+	return ArchivePayload(spec=spec, content=buffer.getvalue(), files=files)
+
+
+def build_archive_payloads(specs: list[ArchiveSpec]) -> tuple[list[ArchivePayload], list[ArchiveSpec]]:
+	payloads: list[ArchivePayload] = []
+	missing: list[ArchiveSpec] = []
+	for spec in specs:
+		if not spec.source.is_dir():
+			missing.append(spec)
+			continue
+		payloads.append(build_archive_payload(spec))
+	return payloads, missing
+
+
 def encode_payload(content: str) -> str:
 	encoded = base64.b64encode(content.encode('utf-8')).decode('ascii')
+	return '\n'.join(textwrap.wrap(encoded, width=76))
+
+
+def encode_binary_payload(content: bytes) -> str:
+	encoded = base64.b64encode(content).decode('ascii')
 	return '\n'.join(textwrap.wrap(encoded, width=76))
 
 
@@ -729,7 +940,17 @@ def heredoc_name(spec: ConfigSpec) -> str:
 	return f'B64_{name}'
 
 
-def build_setup_script(payloads: list[ConfigPayload], port: int, public_url: str) -> str:
+def archive_heredoc_name(spec: ArchiveSpec) -> str:
+	name = re.sub(r'[^A-Za-z0-9]+', '_', spec.target_rel).strip('_').upper()
+	return f'B64_ARCHIVE_{name}'
+
+
+def build_setup_script(
+	payloads: list[ConfigPayload],
+	port: int,
+	public_url: str,
+	archive_payloads: list[ArchivePayload] | None = None,
+) -> str:
 	parts = [
 		SETUP_SCRIPT_HEADER.format(
 			public_proxy_url=shlex.quote(public_url),
@@ -745,6 +966,16 @@ def build_setup_script(payloads: list[ConfigPayload], port: int, public_url: str
 			f'  write_config_file "${{HOME}}/{payload.spec.target_rel}" {shlex.quote(payload.spec.mode)} '
 			f"{shlex.quote(payload.spec.label)} <<'{delimiter}'\n"
 			f'{encode_payload(payload.content)}\n'
+			f'{delimiter}\n'
+		)
+
+	for payload in archive_payloads or []:
+		delimiter = archive_heredoc_name(payload.spec)
+		parts.append(
+			'\n'
+			f'  write_archive_dir "${{HOME}}/{payload.spec.target_rel}" '
+			f"{shlex.quote(payload.spec.label)} <<'{delimiter}'\n"
+			f'{encode_binary_payload(payload.content)}\n'
 			f'{delimiter}\n'
 		)
 
@@ -766,12 +997,15 @@ def render_generation_result(
 	path: Path,
 	changed: bool,
 	payloads: list[ConfigPayload],
+	archive_payloads: list[ArchivePayload],
 	port: int,
 	public_url: str,
 	plain: bool,
 ) -> None:
 	replaced = sum(payload.replacements for payload in payloads)
-	packaged = ', '.join(payload.spec.label for payload in payloads) or '（无，仅安装客户端）'
+	packaged_items = [payload.spec.label for payload in payloads]
+	packaged_items.extend(f'{payload.spec.label} ({payload.files} files)' for payload in archive_payloads)
+	packaged = ', '.join(packaged_items) or '（无，仅安装客户端）'
 
 	if plain:
 		if changed:
@@ -807,13 +1041,22 @@ def load_local_config_texts(
 	return texts, missing
 
 
-def generate_setup_script(args: argparse.Namespace, public_url: str, port: int) -> tuple[Path, bool, list[ConfigPayload]]:
+def load_local_archive_payloads(args: argparse.Namespace) -> tuple[list[ArchivePayload], list[ArchiveSpec]]:
+	payloads, missing = build_archive_payloads(DEFAULT_ARCHIVE_SPECS)
+	warn_missing_local_archives(missing, args.plain)
+	return payloads, missing
+
+
+def generate_setup_script(
+	args: argparse.Namespace, public_url: str, port: int
+) -> tuple[Path, bool, list[ConfigPayload], list[ArchivePayload]]:
 	texts, _missing = load_local_config_texts(args)
 	payloads = build_payloads(texts, port, public_url)
-	content = build_setup_script(payloads, port, public_url)
+	archive_payloads, _archive_missing = load_local_archive_payloads(args)
+	content = build_setup_script(payloads, port, public_url, archive_payloads)
 	output = args.output.expanduser()
 	changed = write_output_script(output, content)
-	return output, changed, payloads
+	return output, changed, payloads, archive_payloads
 
 
 def make_expose_session(port: int, quiet: bool):
@@ -850,8 +1093,8 @@ def run_with_existing_public_url(args: argparse.Namespace) -> int:
 	texts, _missing = load_local_config_texts(args)
 	port = resolve_proxy_port(args, texts)
 	public_url = normalize_public_url(args.public_url)
-	output, changed, payloads = generate_setup_script(args, public_url, port)
-	render_generation_result(output, changed, payloads, port, public_url, args.plain)
+	output, changed, payloads, archive_payloads = generate_setup_script(args, public_url, port)
+	render_generation_result(output, changed, payloads, archive_payloads, port, public_url, args.plain)
 	return 0
 
 
@@ -873,8 +1116,8 @@ def run_with_lyf_expose(args: argparse.Namespace) -> int:
 			raise RuntimeError('lyf-expose did not return a public URL')
 
 		public_url = normalize_public_url(str(tunnel.urls[0]))
-		output, changed, payloads = generate_setup_script(args, public_url, port)
-		render_generation_result(output, changed, payloads, port, public_url, args.plain)
+		output, changed, payloads, archive_payloads = generate_setup_script(args, public_url, port)
+		render_generation_result(output, changed, payloads, archive_payloads, port, public_url, args.plain)
 		wait_for_interrupt(args.plain)
 
 	return 0
