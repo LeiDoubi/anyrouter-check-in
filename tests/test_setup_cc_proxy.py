@@ -1,8 +1,17 @@
 import subprocess
 import tarfile
+from argparse import Namespace
 from io import BytesIO
+from pathlib import Path
 
-from scripts.setup_cc_proxy import ArchiveSpec, build_archive_payload, build_setup_script
+from scripts.setup_cc_proxy import (
+	ArchiveSpec,
+	ConfigPayload,
+	ConfigSpec,
+	build_archive_payload,
+	build_setup_script,
+	config_specs_from_args,
+)
 
 
 def test_generated_setup_script_installs_node_prereqs() -> None:
@@ -20,6 +29,23 @@ def test_generated_setup_script_has_valid_bash_syntax() -> None:
 
 	result = subprocess.run(['bash', '-n'], input=script, text=True, capture_output=True, check=False)
 
+	assert result.returncode == 0, result.stderr
+
+
+def test_default_config_specs_include_codex_global_instructions() -> None:
+	specs = config_specs_from_args(Namespace(include_claude_json=False, include_env_sh=False))
+
+	assert any(spec.target_rel == '.codex/AGENTS.md' for spec in specs)
+
+
+def test_generated_setup_script_writes_codex_global_instructions() -> None:
+	spec = ConfigSpec('Codex global instructions', source=Path('unused'), target_rel='.codex/AGENTS.md')
+	payload = ConfigPayload(spec=spec, content='# Instructions\n', replacements=0)
+
+	script = build_setup_script([payload], 3000, 'https://proxy.example.test')
+
+	assert 'write_config_file "${HOME}/.codex/AGENTS.md"' in script
+	result = subprocess.run(['bash', '-n'], input=script, text=True, capture_output=True, check=False)
 	assert result.returncode == 0, result.stderr
 
 

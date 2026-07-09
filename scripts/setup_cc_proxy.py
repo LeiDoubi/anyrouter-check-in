@@ -80,6 +80,7 @@ DEFAULT_CONFIG_SPECS = [
 	),
 	ConfigSpec('Codex auth', Path.home() / '.codex' / 'auth.json', '.codex/auth.json', required=False),
 	ConfigSpec('Codex config', Path.home() / '.codex' / 'config.toml', '.codex/config.toml', required=False),
+	ConfigSpec('Codex global instructions', Path.home() / '.codex' / 'AGENTS.md', '.codex/AGENTS.md', required=False),
 ]
 
 OPTIONAL_CONFIG_SPECS = {
